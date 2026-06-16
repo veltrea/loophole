@@ -1,0 +1,22 @@
+[project]
+name = "loophole"
+version = "0.1.0"
+description = "Interactive-session command server for Windows over SSH, plus an MCP bridge"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+]
+
+# クライアント（手元機側）は loophole/ パッケージとしてインストールできる。
+# entry point `loophole` が MCP サーバー本体（loophole --setup で対話セットアップ）。
+[project.scripts]
+loophole = "loophole.mcp_server:main"
+loophole-cli = "loophole.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# server/（対象 Windows 側）と tests/ はパッケージに含めない。手元機に入れるのは loophole/ だけ。
+[tool.hatch.build.targets.wheel]
+packages = ["loophole"]

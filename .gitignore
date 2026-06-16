@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.log
+*.png
+*.tgz
+.venv/
+
+# MCP registration embeds an absolute local path — keep it out of the public repo.
+# (loophole.mcp.json is the committed template to copy from.)
+.mcp.json
+
+# Disposable test-account state (holds a throwaway password); never commit.
+.test-account-state.json
+
+# Blog drafts — kept local, never published to the public repo.
+blog/
