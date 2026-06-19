@@ -14,3 +14,7 @@ __pycache__/
 
 # Blog drafts — kept local, never published to the public repo.
 blog/
+note-article-draft.md
+
+# Scratch / throwaway experiments — never commit.
+scratch/

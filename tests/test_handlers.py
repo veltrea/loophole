@@ -66,8 +66,13 @@ h, runner, clip, shot, fs, kbd, win, ime, menu = make_handlers()
 check("run" in h.commands() and "screenshot" in h.commands(), "commands() lists handlers")
 expect_error(lambda: h.dispatch("nonsense", {}), "unknown command raises HandlerError")
 check_eq(h.dispatch("ping", {}), {"pong": True}, "ping returns pong")
-check_eq(h.dispatch("hello", {}), {"user": "testuser", "session_id": 2, "interactive": True, "platform": "win32"},
-         "hello returns environment")
+hello = h.dispatch("hello", {})
+check(hello["user"] == "testuser" and hello["platform"] == "win32" and hello["interactive"] is True,
+      "hello returns environment info")
+check_eq(hello["agent_version"], handlers.AGENT_VERSION,
+         "hello includes agent_version (client/server skew signal)")
+check("mouse_move" in hello["commands"] and "hello" in hello["commands"],
+      "hello includes commands list (server capabilities)")
 
 print("run (argv):")
 runner.next_result = ProcessResult(0, "出力".encode("cp932"), b"")

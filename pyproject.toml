@@ -1,6 +1,6 @@
 [project]
 name = "loophole"
-version = "0.2.0"
+version = "0.3.0"
 description = "Interactive-session command server for Windows and Linux over SSH, plus an MCP bridge"
 requires-python = ">=3.10"
 dependencies = [

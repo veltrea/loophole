@@ -18,7 +18,7 @@ import re
 from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol, Tuple
 
 import keys as keyspec
-from protocol import decode_output
+from protocol import AGENT_VERSION, PROTOCOL_VERSION, decode_output
 
 
 class HandlerError(Exception):
@@ -273,7 +273,15 @@ class Handlers:
     def dispatch(self, cmd: str, args: Dict[str, Any]) -> Any:
         handler: Optional[Callable[[Dict[str, Any]], Any]] = self._table().get(cmd)
         if handler is None:
-            raise HandlerError(f"unknown command: {cmd}")
+            # 大抵は「デプロイ済み agent がクライアントより古く、このコマンドを
+            # まだ実装していない」バージョン不一致。原因を名指しして再デプロイへ導く
+            # （素っ気ない unknown command だけだと skew だと気づけない）。
+            raise HandlerError(
+                f"unknown command: {cmd} — the deployed agent doesn't implement this "
+                f"command, which usually means it is older than the client. Redeploy "
+                f"server/*.py to the agent host and restart the agent (compare the "
+                f"client against hello's 'commands'/'agent_version')."
+            )
         return handler(args)
 
     def commands(self) -> List[str]:
@@ -308,7 +316,14 @@ class Handlers:
         return {"pong": True}
 
     def _hello(self, args: Dict[str, Any]) -> Any:
-        return self._env.describe()
+        # 環境情報に加えて、エージェントのバージョンと対応コマンド一覧を返す。
+        # クライアント（MCP ブリッジ）は自分が広告するツールが commands に含まれるかを
+        # 突き合わせれば、「デプロイ済み agent が古い」状態を呼ぶ前に検知できる。
+        info = dict(self._env.describe())
+        info["agent_version"] = AGENT_VERSION
+        info["protocol_version"] = PROTOCOL_VERSION  # 機械互換判定用（client が突き合わせる）
+        info["commands"] = self.commands()
+        return info
 
     def _run(self, args: Dict[str, Any]) -> Any:
         """コマンドを実行し stdout/stderr/exit_code を返す。

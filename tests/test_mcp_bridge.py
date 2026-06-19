@@ -34,7 +34,9 @@ class FakeClient:
         FakeClient.last = (cmd, args or {})
         canned = {
             "hello": {"ok": True, "result": {"platform": "win32", "user": "testuser",
-                                             "session_id": 1, "interactive": True, "cwd": "C:/x"}},
+                                             "session_id": 1, "interactive": True, "cwd": "C:/x",
+                                             "agent_version": "0.1.0",
+                                             "commands": ["hello", "mouse_move", "ping", "run"]}},
             "run": {"ok": True, "result": {"exit_code": 0, "stdout": "OUT", "stderr": ""}},
             "clipboard_get": {"ok": True, "result": {"text": "表予能"}},
             "clipboard_set": {"ok": True, "result": {"ok": True}},
@@ -75,6 +77,7 @@ mcp_server.Client = FakeClient  # _client() が FakeClient を返すよう差し
 print("tool -> agent command mapping:")
 out = mcp_server.loophole_hello()
 check("session_id=1" in out and "interactive=True" in out, "loophole_hello formats session info")
+check("agent_version=0.1.0" in out, "loophole_hello surfaces agent_version (client/server skew signal)")
 
 out = mcp_server.loophole_shell("echo hi", encoding="cp932")
 check(FakeClient.last == ("run", {"command": "echo hi", "encoding": "cp932"}), "loophole_shell -> run command")

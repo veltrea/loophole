@@ -21,6 +21,27 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterator, Optional, Tuple
 
+# エージェントの semver（人間向けラベル）。リリース識別・CHANGELOG 用。pyproject.toml と揃える。
+# 互換判定には使わない——それは下の PROTOCOL_VERSION の仕事（docs/version-negotiation.md §6・案A）。
+AGENT_VERSION = "0.3.0"
+
+# プロトコル互換版（機械向け・単調増加の整数）。コマンドの引数/戻り値=「契約」が変わったら +1。
+# クライアントはこの整数で互換を判定する（semver の大小では判定しない）。hello で公開する。
+PROTOCOL_VERSION = 1
+
+# プロトコルの正準コマンド集合（agent が実装するコマンド名の全体）。handlers._table() と一致する
+# ことを tests/test_protocol_surface.py が機械的に検証する。コマンドを追加/削除/改名したら、ここを
+# 直すと真上の PROTOCOL_VERSION が目に入る → 契約が変わったなら必ず PROTOCOL_VERSION を上げること。
+PROTOCOL_COMMANDS = frozenset({
+    "ping", "hello", "run", "spawn",
+    "clipboard_get", "clipboard_set", "screenshot",
+    "read_file", "write_file", "send_keys", "find_files",
+    "list_windows", "activate_window",
+    "ime_get", "ime_set",
+    "menu_enumerate", "menu_invoke",
+    "mouse_move", "mouse_click", "mouse_scroll",
+})
+
 
 class ProtocolError(Exception):
     """1 行が JSON として壊れている / 必須フィールド欠落などの不正。"""

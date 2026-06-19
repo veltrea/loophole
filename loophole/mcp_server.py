@@ -18,7 +18,9 @@ Claude Code（や他の MCP クライアント）から、対象 PC（Windows / 
 - 設定の出どころは環境変数 または ~/.loophole/config（env が優先）。主なキー:
       LOOPHOLE_SSH（"user@host"。自動トンネルの宛先・実質これだけ埋めればよい）
       LOOPHOLE_SSH_KEY（鍵パス・任意） / LOOPHOLE_SSH_PORT（SSH ポート・既定 22）
-      LOOPHOLE_SSH_OPTS（追加 ssh オプション・任意） / LOOPHOLE_PORT（既定 9999） / LOOPHOLE_TOKEN（任意）
+      LOOPHOLE_SSH_OPTS（追加 ssh オプション・任意） / LOOPHOLE_PORT（手元の転送ポート・既定 9999）
+      LOOPHOLE_REMOTE_PORT（対象 agent の待受ポート・既定=LOOPHOLE_PORT。複数マシン同時利用時は
+        手元だけ別ポートにし、これを 9999 に固定する） / LOOPHOLE_TOKEN（任意）
 - 対象 PC への到達は SSH ポートフォワード（ssh -L 9999:127.0.0.1:9999）。認証は SSH に丸投げ。
   LOOPHOLE_SSH があれば起動時に ssh -L を内部で spawn し（終了時に畳む）、手動トンネルを不要にする。
   未設定なら従来どおり外側のトンネルに繋ぐだけ。ポートが既に開いていれば spawn せず再利用する。
@@ -37,11 +39,13 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from mcp.server.fastmcp import FastMCP, Image
 
 from .cli import Client  # 薄いクライアント（Client クラス・protocol を使う）
+from . import registry    # 接続先レジストリ（マルチターゲット・JSON）
 
 
 def _log(msg: str) -> None:
@@ -69,6 +73,9 @@ _CONFIG_TEMPLATE = """\
 #LOOPHOLE_SSH_PORT=22
 #LOOPHOLE_SSH_OPTS=-o ProxyJump=none
 #LOOPHOLE_PORT=9999
+# 複数マシンを同時に使うとき: 手元の LOOPHOLE_PORT をマシンごとに変え（例 10000, 10001…）、
+# 対象 agent の待受ポート（既定 9999）はこの LOOPHOLE_REMOTE_PORT で固定する。
+#LOOPHOLE_REMOTE_PORT=9999
 #LOOPHOLE_TOKEN=
 """
 
@@ -105,10 +112,45 @@ def _load_config_file(create_template: bool = True) -> None:
         _log(f"設定ファイルを読めませんでした: {CONFIG_PATH}（{exc}）")
 
 
+def _registry_path() -> str:
+    return os.path.expanduser(os.environ.get("LOOPHOLE_REGISTRY", "~/.loophole/registry.json"))
+
+
+def _apply_target_from_registry() -> None:
+    """LOOPHOLE_TARGET（無ければレジストリの default_target）を解決し、未設定の env を埋める。
+
+    明示された env（LOOPHOLE_SSH 等）は上書きしない＝env が優先（既存の単一ターゲット設定を壊さない）。
+    レジストリが無い/対象が無ければ何もしない。手元ポートはターゲットごとに別、リモートは既定 9999。
+    """
+    try:
+        reg = registry.load(_registry_path())
+        target = registry.get_target(reg, os.environ.get("LOOPHOLE_TARGET"))
+    except Exception:
+        return
+    if target is None:
+        return
+    fill = {
+        "LOOPHOLE_SSH": target.get("ssh"),
+        "LOOPHOLE_PORT": target.get("local_port"),
+        "LOOPHOLE_REMOTE_PORT": target.get("remote_port"),
+        "LOOPHOLE_SSH_KEY": target.get("ssh_key"),
+        "LOOPHOLE_SSH_OPTS": target.get("ssh_opts"),
+    }
+    for k, v in fill.items():
+        if v not in (None, "") and not os.environ.get(k):
+            os.environ[k] = str(v)
+    os.environ["LOOPHOLE_ACTIVE_TARGET"] = target["name"]
+
+
 _load_config_file(create_template="--setup" not in sys.argv)
+_apply_target_from_registry()  # レジストリの LOOPHOLE_TARGET / default を env に反映（env 優先）
 
 HOST = os.environ.get("LOOPHOLE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("LOOPHOLE_PORT", "9999"))
+# 対象 PC 上で agent が待ち受けるポート（ssh -L のリモート側）。既定はローカルと同じ＝従来挙動。
+# 複数マシンを同時に使うときは「手元だけ別ポート・リモートは 9999 固定」にできる:
+#   別セッションで LOOPHOLE_PORT=10000 LOOPHOLE_REMOTE_PORT=9999 → 手元 10000 を対象の 9999 へ転送。
+REMOTE_PORT = int(os.environ.get("LOOPHOLE_REMOTE_PORT", str(PORT)))
 TOKEN = os.environ.get("LOOPHOLE_TOKEN") or None
 
 mcp = FastMCP(
@@ -155,6 +197,34 @@ def _close_tunnel() -> None:
         proc.kill()
 
 
+def _tunnel_argv(target: str, local_port: int, remote_port: int,
+                 ssh_port: str | None = None, key: str | None = None,
+                 extra: str | None = None) -> list[str]:
+    """ssh -L の argv を組み立てる純関数（I/O 無し・テスト可）。
+
+    -L は {local_port}:127.0.0.1:{remote_port}。ローカルとリモートを分けられるので、対象 agent は
+    9999 のまま、手元だけターゲットごとに別ポートを使える（＝複数マシン同時利用・agent 無改修）。
+    """
+    argv = ["ssh"]
+    if ssh_port:
+        argv += ["-p", str(ssh_port)]
+    if key:
+        argv += ["-i", os.path.expanduser(key)]
+    argv += [
+        "-N",  # コマンドを実行しない（ポート転送だけ）
+        "-o", "ExitOnForwardFailure=yes",   # 転送に失敗したら即終了（黙って繋がらないを防ぐ）
+        "-o", "ServerAliveInterval=30",     # 無通信でも生存確認を送り、寝落ち回線を検知
+        "-o", "ServerAliveCountMax=3",
+        "-o", "BatchMode=yes",              # パスフレーズ/パスワードを尋ねず即失敗（TTY が無い）
+        "-o", "StrictHostKeyChecking=accept-new",  # 初回の未知ホストは TOFU で受理、変更時は拒否
+        "-L", f"{local_port}:127.0.0.1:{remote_port}",
+    ]
+    if extra:
+        argv += shlex.split(extra)  # 例: "-o ProxyJump=none"
+    argv.append(target)
+    return argv
+
+
 def _open_tunnel() -> bool:
     """LOOPHOLE_SSH があれば ssh -L を spawn し、ローカルポートが開くまで待つ。
 
@@ -169,29 +239,25 @@ def _open_tunnel() -> bool:
         return False  # 未設定 — チャットから loophole_configure で設定する
 
     if _port_open("127.0.0.1", PORT):
-        _log(f"ポート {PORT} は既に開いています。既存のトンネルを再利用します（ssh は起動しません）")
+        if _tunnel is None or _tunnel.poll() is not None:
+            # このプロセスが張ったトンネルではない＝別セッションの残骸かもしれない。
+            # 宛先が違う古いトンネル（例: 前回の別マシンへの ssh -L）を盲目的に再利用すると、
+            # loophole が「別のマシン」に繋がって reset/無応答になる（実トラブルあり）。
+            # 殺すのは破壊的なので避け、原因を即特定できるよう警告だけ強く出す。
+            _log(f"⚠ ポート {PORT} は既に開いていますが、このプロセスが張ったものではありません。"
+                 f"別宛先への古い ssh -L が残っている場合、loophole は {target} ではなくそちらへ"
+                 f"繋がります。loophole が別マシンに繋がる/reset する時は "
+                 f"`lsof -nP -iTCP:{PORT}` で宛先を確認し、違っていればその ssh を kill してください。")
+        else:
+            _log(f"ポート {PORT} は既に開いています。既存のトンネルを再利用します（ssh は起動しません）")
         return True
 
-    argv = ["ssh"]
-    ssh_port = os.environ.get("LOOPHOLE_SSH_PORT")
-    if ssh_port:
-        argv += ["-p", ssh_port]
-    key = os.environ.get("LOOPHOLE_SSH_KEY")
-    if key:
-        argv += ["-i", os.path.expanduser(key)]
-    argv += [
-        "-N",  # コマンドを実行しない（ポート転送だけ）
-        "-o", "ExitOnForwardFailure=yes",   # 転送に失敗したら即終了（黙って繋がらないを防ぐ）
-        "-o", "ServerAliveInterval=30",     # 無通信でも生存確認を送り、寝落ち回線を検知
-        "-o", "ServerAliveCountMax=3",
-        "-o", "BatchMode=yes",              # パスフレーズ/パスワードを尋ねず即失敗（TTY が無い）
-        "-o", "StrictHostKeyChecking=accept-new",  # 初回の未知ホストは TOFU で受理、変更時は拒否
-        "-L", f"{PORT}:127.0.0.1:{PORT}",
-    ]
-    extra = os.environ.get("LOOPHOLE_SSH_OPTS")
-    if extra:
-        argv += shlex.split(extra)  # 例: "-o ProxyJump=none"
-    argv.append(target)
+    argv = _tunnel_argv(
+        target, PORT, REMOTE_PORT,
+        ssh_port=os.environ.get("LOOPHOLE_SSH_PORT"),
+        key=os.environ.get("LOOPHOLE_SSH_KEY"),
+        extra=os.environ.get("LOOPHOLE_SSH_OPTS"),
+    )
 
     # ssh の stderr は一時ファイルへ（PIPE を読まず放置するとバッファ詰まりで固まりうる）。
     # stdin/stdout は DEVNULL に倒す — このプロセスの stdin/stdout は MCP の JSONL 用。
@@ -207,7 +273,7 @@ def _open_tunnel() -> bool:
         if _port_open("127.0.0.1", PORT):
             _tunnel = proc
             atexit.register(_close_tunnel)
-            _log(f"SSH トンネルを張りました: {PORT}->127.0.0.1:{PORT} 経由 {target}（pid {proc.pid}）")
+            _log(f"SSH トンネルを張りました: {PORT}->127.0.0.1:{REMOTE_PORT} 経由 {target}（pid {proc.pid}）")
             return True
         time.sleep(0.3)
 
@@ -228,16 +294,22 @@ def _open_tunnel() -> bool:
     return False
 
 
-def _probe_ssh(target: str, base_opts: str = "") -> tuple[bool, str, str]:
+def _probe_ssh(target: str, base_opts: str = "", key: str = "") -> tuple[bool, str, str]:
     """target へ実際に SSH して 1 行返るか試す（print しない・MCP ツールからも使える）。
 
     一度で繋がらなければ VPN・踏み台回避（ProxyJump=none）で 1 回だけ試し直す——専門用語を
     ユーザーに聞かずに、よくある詰まりを裏で吸収するため。
     戻り値: (成功か, 実際に効いた追加 ssh オプション, 失敗時の ssh 出力)。
+
+    key を渡したら _open_tunnel と同じく必ず `-i <key>` を付ける。これが無いと
+    IdentitiesOnly=yes（リトライで付与）の下で ssh_config の別ホスト用 IdentityFile を
+    試してしまい、本来通る鍵があっても Permission denied になる（実トラブルあり）。
     """
     def attempt(extra: str) -> tuple[bool, str]:
         argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
                 "-o", "StrictHostKeyChecking=accept-new"]
+        if key:
+            argv += ["-i", os.path.expanduser(key)]
         if extra:
             argv += shlex.split(extra)
         argv += [target, "echo loophole-ok"]
@@ -300,10 +372,13 @@ def loophole_hello() -> str:
     spawning will actually affect a visible desktop.
     """
     r = _call("hello")
+    # agent_version は古い agent では返らない（None 表示）＝この agent はバージョン公開前の
+    # 古いデプロイ、というそれ自体が有用な合図。新コマンドが unknown command で弾かれたら
+    # まず agent_version / クライアントとの差を疑い、server/*.py を再デプロイする。
     return (
         f"platform={r.get('platform')} user={r.get('user')} "
         f"session_id={r.get('session_id')} interactive={r.get('interactive')} "
-        f"cwd={r.get('cwd')}"
+        f"agent_version={r.get('agent_version')} cwd={r.get('cwd')}"
     )
 
 
@@ -315,20 +390,102 @@ def loophole_status() -> str:
     their target machine's IP address and their username on it, then call
     loophole_configure with those.
     """
+    # レジストリの登録ターゲット一覧（あれば）— マルチマシン運用の見取り図
+    try:
+        _names = sorted(registry.load(_registry_path()).get("targets", {}).keys())
+    except Exception:
+        _names = []
+    reg_line = ""
+    if _names:
+        _active = os.environ.get("LOOPHOLE_ACTIVE_TARGET") or os.environ.get("LOOPHOLE_TARGET")
+        reg_line = f"\nregistered_targets={_names}" + (f" active_target={_active}" if _active else "")
+
     configured = bool(os.environ.get("LOOPHOLE_SSH"))
     if not configured:
         return ("configured=false — loophole はまだセットアップされていません。"
                 "ユーザーに対象 PC の IP アドレスとユーザー名を聞いて "
-                "loophole_configure を呼んでください。")
+                "loophole_configure を呼んでください。" + reg_line)
     target = os.environ.get("LOOPHOLE_SSH")
     reachable = _port_open("127.0.0.1", PORT)
     tail = "" if reachable else ("（ポートに届いていません。対象 PC・loophole サーバーの起動を確認、"
                                  "または loophole_configure で設定し直し）")
-    return f"configured=true target={target} reachable={reachable}{tail}"
+    base = (f"configured=true target={target} "
+            f"tunnel={PORT}->127.0.0.1:{REMOTE_PORT} reachable={reachable}{tail}{reg_line}")
+    return f"{base}\n{_compat_summary}" if _compat_summary else base
 
 
 @mcp.tool()
-def loophole_configure(host_ip: str, username: str,
+def loophole_reload() -> str:
+    """Restart loophole's own MCP server process to pick up edited client source.
+
+    loophole runs from an editable install, so the source on disk is always the
+    newest — but a long-lived session keeps the *old* code loaded in memory until
+    the process restarts. This makes the local MCP server exit; the MCP host
+    (e.g. Claude Code) transparently reconnects on the next loophole tool call,
+    spawning a fresh process that loads the current on-disk source. Use it right
+    after editing loophole's client code, to make it live WITHOUT reopening the
+    window.
+
+    The next loophole tool call is what triggers the reconnect (a sub-second gap).
+    The shared SSH tunnel is intentionally left up so the fresh process — and any
+    other session — reuses it.
+    """
+    def _restart() -> None:
+        # 応答が stdout に書き出されてから pipe を閉じたいので、わずかに待ってから落とす。
+        # os._exit は意図的（atexit / main() の finally を踏ませない）= _close_tunnel() を
+        # 呼ばせない。トンネルは共有で、次に立ち上がるプロセスが再利用するため閉じてはいけない。
+        time.sleep(0.5)
+        os._exit(0)
+
+    threading.Thread(target=_restart, daemon=True).start()
+    return ("loophole サーバーを再起動します。次に loophole ツールを呼んだ時点で、"
+            "ディスク上の最新ソースで自動再接続します（コンマ数秒の空白あり）。"
+            "ローカルの client コードを編集した後に使ってください。")
+
+
+def _configure_register(name: str, target: str, ssh_key: str, ssh_opts: str,
+                        ok: bool, detail: str) -> str:
+    """loophole_configure の name 指定パス: ターゲットをレジストリに登録する。
+
+    手元ポートを自動採番（1 個目=9999、以降=10000+）。対象 agent は 9999 のままでよい。
+    現セッションが未接続で、割当ポートが現在の手元ポートと一致するときだけ、今すぐ接続も行う
+    （初回セットアップの利便）。別ポートのターゲットは登録のみ——LOOPHOLE_TARGET で開き直して使う。
+    """
+    try:
+        reg = registry.load(_registry_path())
+        registry.add_target(reg, name, target,
+                            ssh_key=(ssh_key or "").strip(), ssh_opts=ssh_opts or "")
+        registry.save(reg, _registry_path())
+    except (OSError, ValueError) as exc:
+        raise _AgentError(f"レジストリに登録できませんでした: {exc}")
+    local_port = registry.get_target(reg, name)["local_port"]
+    use_hint = ('使うには、対象プロジェクトの .mcp.json の env に '
+                f'"LOOPHOLE_TARGET": "{name}" を入れて開けば、自動で手元ポート {local_port} 経由で'
+                "繋がります（対象 agent は 9999 のままでよい）。")
+    if not ok:
+        return (f"'{name}' をレジストリに登録しました（手元ポート {local_port}）。ただし今は SSH で"
+                "届きません（電源/IP/ユーザー名/鍵を確認）。"
+                + (f" 詳細: {detail}" if detail else "") + " " + use_hint)
+    # 現セッションが未接続 & 割当ポート==現在の手元ポート のときだけ、今すぐ繋ぐ。
+    if not os.environ.get("LOOPHOLE_SSH") and local_port == PORT:
+        os.environ["LOOPHOLE_SSH"] = target
+        os.environ["LOOPHOLE_ACTIVE_TARGET"] = name
+        if (ssh_key or "").strip():
+            os.environ["LOOPHOLE_SSH_KEY"] = os.path.expanduser(ssh_key.strip())
+        if ssh_opts:
+            os.environ["LOOPHOLE_SSH_OPTS"] = ssh_opts
+        else:
+            os.environ.pop("LOOPHOLE_SSH_OPTS", None)
+        _close_tunnel()
+        _open_tunnel()
+        return (f"'{name}' を登録し、このセッションを接続しました（{target} / 手元ポート {local_port}）。"
+                + use_hint)
+    return (f"'{name}' をレジストリに登録しました（手元ポート {local_port}・SSH 疎通OK）。" + use_hint
+            + " このセッション自体の接続先は変えていません。")
+
+
+@mcp.tool()
+def loophole_configure(host_ip: str, username: str, name: str = "",
                        ssh_key: str = "", ssh_opts: str = "") -> str:
     """Set up loophole's connection to the target machine (Windows or Linux), in chat.
 
@@ -341,9 +498,15 @@ def loophole_configure(host_ip: str, username: str,
     fails), writes ~/.loophole/config, opens the SSH tunnel, and checks that the
     loophole agent on the target answers. Returns a plain-language status to relay.
 
+    To drive SEVERAL machines at once, pass a short `name` per machine (e.g. "winpc",
+    "linux1"): each is stored in the multi-target registry with its own local tunnel port
+    (the target agent stays on 9999). Then open one project per machine with
+    LOOPHOLE_TARGET=<name> in its .mcp.json env. Leave `name` blank for classic single use.
+
     Args:
         host_ip: the target machine's IP address, e.g. "192.168.1.x"
         username: the user's account name on that machine (the SSH login user)
+        name: optional short label to register THIS machine as a named target (multi-machine)
         ssh_key: optional SSH private key path (blank = default key / ssh-agent)
         ssh_opts: optional extra ssh options (blank = none; auto-handled)
     """
@@ -355,7 +518,13 @@ def loophole_configure(host_ip: str, username: str,
     target = f"{username}@{host_ip}"
 
     # 1) 実際に SSH して試す（踏み台回避の自動リトライ込み・専門設定は裏で）
-    ok, working_opts, detail = _probe_ssh(target, (ssh_opts or "").strip())
+    #    鍵を probe にも渡す——付けないと IdentitiesOnly 下で別ホスト用の鍵を試して落ちる。
+    ok, working_opts, detail = _probe_ssh(
+        target, (ssh_opts or "").strip(), (ssh_key or "").strip())
+
+    # マルチターゲット: name 指定時はレジストリに登録して返す（単一ターゲットの従来パスは下）。
+    if (name or "").strip():
+        return _configure_register(name.strip(), target, ssh_key, working_opts, ok, detail)
 
     # 2) 設定ファイルを書く（次回起動でも効く）
     lines = ["# loophole 設定 — loophole_configure が自動生成", f"LOOPHOLE_SSH={target}"]
@@ -726,10 +895,12 @@ def loophole_menu(action: str, title: str | None = None,
         was sent, not that it finished - observe the result yourself (app log,
         loophole_window list for new dialogs, or re-list to see a toggle flip).
 
-    Windows: classic Win32 menu bars (Notepad, many native apps, FileMaker); Ribbon
-    (Office) / Electron / UWP report "no menu bar". Linux: any app exposing accessibility
-    (AT-SPI) - the menu targets the active app; apps without a11y report "no menu bar".
-    Where unsupported, fall back to screenshots + mouse/keyboard.
+    Windows: classic Win32 menu bars (Notepad, native apps, FileMaker), plus a UIA
+    (accessibility) fallback for modern apps with no classic menu (WPF / WinForms / UWP /
+    WinUI; needs comtypes on the target). Ribbon (Office) / Electron stay best-effort and
+    often report "no menu bar". Linux: any app exposing accessibility (AT-SPI) - the menu
+    targets the active app; apps without a11y report "no menu bar". Where unsupported,
+    fall back to screenshots + mouse/keyboard.
 
     Args:
         action: "list" or "invoke"
@@ -754,8 +925,8 @@ def loophole_menu(action: str, title: str | None = None,
             return amb
         if not r.get("supported"):
             return (f"window hwnd={r.get('hwnd')} exposes no menu bar "
-                    f"(Windows ribbon/Electron/UWP, or a Linux app without AT-SPI "
-                    f"accessibility). Fall back to a screenshot + mouse/keyboard.")
+                    f"(Windows Ribbon/Electron, or an app exposing no menu via "
+                    f"UIA/AT-SPI accessibility). Fall back to a screenshot + mouse/keyboard.")
         body = "\n".join(_render_menu(r.get("items", []))) or "(empty menu)"
         return f"menu of hwnd={r.get('hwnd')} {r.get('title')!r}:\n{body}"
 
@@ -885,6 +1056,115 @@ def _run_setup() -> None:
     print("（対象の PC が寝ているときは、先に起こして loophole を動かしておいてください）")
 
 
+# --- 接続時バージョンネゴシエーション（docs/version-negotiation.md）-----------
+# 機械互換は専用の整数 PROTOCOL_VERSION で判定（人向け semver とは分離・案A）。各ツールが
+# 必要とする agent コマンドを宣言し、agent の hello.commands に無いものは接続時に登録解除する
+# （お行儀よく「使えないツールは見せない」）。loophole_hello/status/reload/configure は接続診断・
+# 設定用なので常に公開（ゲート対象外）。
+EXPECTED_PROTOCOL = 1          # このクライアントが前提とする agent プロトコル版
+MIN_COMPATIBLE_PROTOCOL = 1    # これ未満の agent は「古すぎ」＝強い警告
+_compat_summary = ""           # 接続時ネゴシエーションの結果（loophole_status が読む）
+
+TOOL_REQUIREMENTS: dict[str, list[str]] = {
+    "loophole_shell": ["run"],
+    "loophole_run": ["run"],
+    "loophole_clipboard_get": ["clipboard_get"],
+    "loophole_clipboard_set": ["clipboard_set"],
+    "loophole_screenshot": ["screenshot"],
+    "loophole_gui": ["spawn"],
+    "loophole_read_file": ["read_file"],
+    "loophole_write_file": ["write_file"],
+    "loophole_send_keys": ["send_keys"],
+    "loophole_mouse": ["mouse_move", "mouse_click", "mouse_scroll"],
+    "loophole_find_files": ["find_files"],
+    "loophole_ime_get": ["ime_get"],
+    "loophole_ime_set": ["ime_set"],
+    "loophole_menu": ["menu_enumerate", "menu_invoke"],
+}
+
+
+def _handshake(timeout: float = 8.0) -> dict | None:
+    """接続時に hello を1回叩いて agent の能力を取得。不達/未設定なら None（=ゲートしない）。"""
+    if not os.environ.get("LOOPHOLE_SSH"):
+        return None
+    try:
+        r = _call("hello", timeout=timeout, via="handshake")
+    except _AgentError:
+        return None
+    return {
+        "protocol_version": r.get("protocol_version"),
+        "agent_version": r.get("agent_version"),
+        "commands": r.get("commands"),
+    }
+
+
+def _compat_verdict(protocol_version) -> tuple[str, str]:
+    """agent の protocol_version を EXPECTED/MIN と突き合わせ (level, message) を返す。純関数。"""
+    if protocol_version is None:
+        return ("outdated",
+                "agent がプロトコル版を報告しません（version 報告より前の古いデプロイ）。"
+                "server/*.py の再デプロイを推奨。")
+    try:
+        pv = int(protocol_version)
+    except (TypeError, ValueError):
+        return ("unknown", f"agent の protocol_version が不正です（{protocol_version!r}）。")
+    if pv < MIN_COMPATIBLE_PROTOCOL:
+        return ("too_old",
+                f"agent protocol v{pv} はクライアント下限 v{MIN_COMPATIBLE_PROTOCOL} 未満。"
+                f"server/*.py を再デプロイしてください（未対応ツールは無効化されます）。")
+    if pv > EXPECTED_PROTOCOL:
+        return ("client_old",
+                f"agent protocol v{pv} はクライアント前提 v{EXPECTED_PROTOCOL} より新しい。"
+                f"クライアント（loophole/）の更新を検討。")
+    return ("ok", f"protocol v{pv} 互換OK。")
+
+
+def _tools_to_gate(commands) -> list[str]:
+    """agent の commands に必要コマンドが揃わないツール名を返す。純関数。
+
+    commands が偽値（古い agent で未報告 / 空）なら判定材料が無いのでゲートしない（[]）。
+    """
+    if not commands:
+        return []
+    have = set(commands)
+    return sorted(t for t, needs in TOOL_REQUIREMENTS.items()
+                  if not set(needs).issubset(have))
+
+
+def _negotiate() -> None:
+    """接続時ネゴシエーション本体。main() で mcp.run() の前に1回呼ぶ。"""
+    global _compat_summary
+    caps = _handshake()
+    if caps is None:
+        _compat_summary = ("接続時の版確認はできませんでした（agent 不達/未設定）。"
+                           "全ツールを公開しています。loophole_status で疎通を確認してください。")
+        _log("版ネゴシエーション: agent 不達/未設定 → 全ツール公開（ベストエフォート）")
+        return
+    level, vmsg = _compat_verdict(caps.get("protocol_version"))
+    gated = _tools_to_gate(caps.get("commands"))
+    for name in gated:
+        try:
+            mcp._tool_manager.remove_tool(name)
+        except Exception as exc:  # 内部 API 変更に強く：失敗してもサーバーは上げる
+            _log(f"版ネゴシエーション: ツール {name} の登録解除に失敗（{exc}）")
+    summary = (f"[版] {vmsg} agent_version={caps.get('agent_version')} "
+               f"protocol={caps.get('protocol_version')} expected={EXPECTED_PROTOCOL}.")
+    if gated:
+        summary += (f" この agent では未対応のため無効化したツール: {', '.join(gated)}"
+                    f"（agent を再デプロイすれば次回接続で復活）。")
+    else:
+        summary += " 全ツール利用可能。"
+    _compat_summary = summary
+    _log("版ネゴシエーション: " + summary)
+    # instructions にも載せ、接続時に AI が読めるようにする（best-effort・内部APIなので失敗許容）
+    try:
+        srv = mcp._mcp_server
+        if getattr(srv, "instructions", None):
+            srv.instructions = f"{srv.instructions}\n\n{summary}"
+    except Exception:
+        pass
+
+
 def main() -> None:
     """entry point（pyproject の [project.scripts] loophole = …:main）。
 
@@ -894,6 +1174,7 @@ def main() -> None:
         _run_setup()
     else:
         _open_tunnel()  # LOOPHOLE_SSH があれば ssh -L を内部で張る（無ければ何もしない）
+        _negotiate()    # 版を擦り合わせ、未対応ツールを外し、結果を _compat_summary に残す
         try:
             mcp.run()
         finally:
