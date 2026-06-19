@@ -43,6 +43,9 @@ class FakeClient:
             "read_file": {"ok": True, "result": {"text": "file body"}},
             "write_file": {"ok": True, "result": {"ok": True}},
             "send_keys": {"ok": True, "result": {"sent": ["ctrl+s"], "count": 1}},
+            "mouse_move": {"ok": True, "result": {"moved": True, "x": 640, "y": 360}},
+            "mouse_click": {"ok": True, "result": {"clicked": 2, "button": "right"}},
+            "mouse_scroll": {"ok": True, "result": {"scrolled": True, "dx": 0, "dy": 3}},
             "find_files": {"ok": True, "result": {
                 "matches": [{"path": "C:/a.txt", "size": 5, "mtime": 0.0}],
                 "truncated": False, "scanned": 3}},
@@ -98,6 +101,21 @@ check(FakeClient.last == ("write_file", {"path": "C:/w.txt", "text": "body"}), "
 out = mcp_server.loophole_send_keys("ctrl+s")
 check(FakeClient.last == ("send_keys", {"keys": "ctrl+s"}), "loophole_send_keys -> send_keys")
 check("ctrl+s" in out, "loophole_send_keys echoes the strokes sent")
+
+mcp_server.loophole_mouse("move", x=640, y=360)
+check(FakeClient.last == ("mouse_move", {"x": 640, "y": 360}), "loophole_mouse move -> mouse_move")
+mcp_server.loophole_mouse("click", x=10, y=20, button="right", count=2)
+check(FakeClient.last == ("mouse_click", {"button": "right", "count": 2, "x": 10, "y": 20}),
+      "loophole_mouse click -> mouse_click with button/count/coords")
+out = mcp_server.loophole_mouse("scroll", dy=3)
+check(FakeClient.last == ("mouse_scroll", {"dx": 0, "dy": 3}) and "dy=3" in out,
+      "loophole_mouse scroll -> mouse_scroll")
+err = None
+try:
+    mcp_server.loophole_mouse("teleport")
+except Exception as exc:
+    err = str(exc)
+check(err is not None and "move" in err, "loophole_mouse rejects unknown action")
 
 out = mcp_server.loophole_find_files("C:/proj", "*.txt")
 check(FakeClient.last[0] == "find_files"

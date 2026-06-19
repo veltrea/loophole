@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import agent  # noqa: E402
-from win_backends import build_handlers  # noqa: E402
+from backends import build_handlers  # noqa: E402
 from loophole.cli import Client  # noqa: E402
 
 failures = 0

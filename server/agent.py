@@ -139,13 +139,13 @@ def main(argv=None) -> int:
         from history import History
         history = History()
 
-    # 実 OS バックエンドでハンドラを組む（Windows なら Win32 API を ctypes で直叩き）
-    from win_backends import build_handlers
+    # 実 OS バックエンドでハンドラを組む（Windows=Win32 / Linux=X11 を ctypes 直叩き）
+    from backends import build_handlers
     agent = Agent(build_handlers(), token=args.token, history=history)
 
     if args.view_port:
         import viewer
-        from win_backends import build_screenshotter
+        from backends import build_screenshotter
         view_thread = threading.Thread(
             target=viewer.serve_view,
             args=(build_screenshotter(), args.host, args.view_port, args.view_fps, history),

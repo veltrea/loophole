@@ -1,85 +1,104 @@
 # loophole
 
-**クロスプラットフォーム開発のテスト用ツール。** 手元の Mac で開発したソフトを、リモートの Windows で
-動作確認したいとき、別 OS の実機に張り付かずにテストできる。構成は、操作対象の **Windows で待ち受ける
-サーバー**と、手元機の **Claude Code から呼ぶクライアント**の2部。Claude の computer use などで Windows の
-GUI アプリをテスト自動化するとき、**座標を触らない作業をまとめて肩代わり**する。
+**Read this in other languages:** [日本語](README.ja.md)
 
-computer use の置き換えではなく**併用**するもの。遅い「スクショ→画像認識→座標クリック」の
-回数を減らし、トークン消費を抑える。
+**A testing tool for cross-platform development.** When you build software on your Mac and want to
+verify it on a remote **Windows or Linux** machine, loophole lets you test without sitting at the
+other OS's physical machine. It has two parts: a **server that listens on the target PC (Windows or
+Linux)**, and a **client called from Claude Code on your local machine**. When you automate testing of
+the target's GUI apps with Claude's computer use, loophole **takes over all the work that doesn't need
+pixel coordinates**.
 
-> **対応（現状）:** 手元機 = Mac、対象 = Windows のみ。Mac→Linux など他の組み合わせは順次対応していく予定。
+It's not a replacement for computer use but a **companion** to it: it cuts the number of slow
+"screenshot → image recognition → click-by-coordinate" round trips and lowers token usage.
 
-## できること
+> **Support (current):** local machine = Mac. Target = **Windows** and **Linux**.
+> Linux is **fully supported on X11** (screenshot, key sending, and window control via direct
+> libX11/libXtst ctypes; the clipboard is owned in-process, so no external tool is needed).
+> **Wayland is partial** (screenshot via grim, clipboard via wl-clipboard, key sending via ydotool,
+> window control via sway/Hyprland IPC; window control on GNOME/KDE is out of scope).
+> IME (fcitx5/ibus) and menus (AT-SPI) work on both X11 and Wayland.
 
-手元機（Mac など）から、対象の Windows に対して:
+## What it can do
 
-- **アプリ／プロセスを起動**する（GUI も実際に画面に出る）
-- **コマンドを実行**して結果（stdout・stderr・終了コード）を受け取る
-- **スクリーンショット**を撮る
-- **クリップボード**でテキストを渡す／回収する（日本語 IME を通らない）
-- **ファイル**を読み書きする／名前で**検索**する
-- **キーボードショートカット**を送る（`ctrl+s`・`win+r` など修飾キー＋キーの組）
-- **ウィンドウ**を一覧する／タイトルで**前面化**する
-- **日本語 IME** の ON/OFF・変換モードを取得／切り替える
-- **クラシック Win32 メニューバー**を画面を見ずに列挙し、項目を実行する
+From your local machine (a Mac, etc.), against the target PC (Windows or Linux):
 
-さらに、操作の様子を手元のブラウザで**見る**こともできる（read-only・`--view-port` で任意起動）:
+- **Launch apps / processes** (GUIs actually appear on screen)
+- **Run commands** and get the result (stdout, stderr, exit code)
+- **Take screenshots**
+- **Pass / retrieve text via the clipboard** (bypasses the Japanese IME)
+- **Read / write files**, and **search** for them by name
+- **Send keyboard shortcuts** (modifier + key chords like `ctrl+s`, `win+r`)
+- **List windows** and **bring one to the front** by title
+- **Get / toggle the Japanese IME** on/off and conversion mode (Windows = IMM32, Linux = fcitx5/ibus)
+- **Enumerate a menu bar without looking at the screen** and invoke an item (Windows = classic Win32
+  menus, Linux = the AT-SPI accessibility tree)
 
-- **対象の画面をライブで覗く**（MJPEG ストリーム）
-- **実行したコマンドの履歴を見る**（新しい順の一覧）
+You can also **watch** what's happening from a browser on your local machine (read-only, started only
+with `--view-port`):
 
-## 構成
+- **Peek at the target's screen live** (MJPEG stream)
+- **See the history of executed commands** (newest first)
+
+## Architecture
 
 ```
-手元機（Claude Code ＋ loophole クライアント）  ──ssh -L トンネル──▶  対象 Windows（server/agent.py が常駐）
+local machine (Claude Code + loophole client)  ──ssh -L tunnel──▶  target PC (server/agent.py resident)
 ```
 
-サーバー（`server/agent.py`）は対象 Windows の `127.0.0.1` だけで待ち受け、手元機からは SSH トンネル
-経由でのみ届く（LAN にポートを開かず、認証は SSH に任せる）。**使う前に「対象 Windows でサーバーを
-起動」しておくのはこのため。** トンネル自体は、初回に Claude へ「loophole の設定をして」と頼んで
-接続先を一度答えておけば、以降は MCP クライアントが起動時に自動で張るので、毎回の手動操作は要らない
-（[client-setup.md](docs/client-setup.md)）。
+The server (`server/agent.py`) listens only on the target's `127.0.0.1` and is reachable from your
+local machine only through an SSH tunnel (no port opened to the LAN; authentication is left to SSH).
+**This is why you start the server on the target PC before using it.** For the tunnel itself, you ask
+Claude once to "set up loophole" and answer the destination a single time; after that the MCP client
+opens the tunnel automatically on startup, so no manual step is needed each time
+([client-setup.md](docs/client-setup.md)).
 
-## インストール
+## Install
 
-操作する **手元機（Mac など）** と、操作される **対象 Windows** の**両方**に入れる。手順はそれぞれ別マニュアルに:
+Install on **both** the **local machine (a Mac, etc.)** you operate from and the **target PC** you
+operate. The steps are in separate manuals:
 
-- **① 対象 Windows（サーバー側）** — OpenSSH・Python・loophole を入れてデスクトップに常駐させる → [docs/windows-setup.md](docs/windows-setup.md)
-- **② 手元機（クライアント側）** — `uv` で入れて、対話セットアップを1回走らせるだけ（宛先を聞かれ、設定も Claude への登録も自動） → [docs/client-setup.md](docs/client-setup.md)
+- **① Target PC (server side)**
+  - Windows — install OpenSSH, Python, and loophole, and keep it resident on the desktop → [docs/windows-setup.md](docs/windows-setup.md)
+  - Linux — install OpenSSH, Python, and the per-capability packages, and keep it resident → [docs/linux-setup.md](docs/linux-setup.md)
+- **② Local machine (client side)** — install with `uv` and run the interactive setup once (it asks for
+  the destination and handles both the config and registering with Claude) → [docs/client-setup.md](docs/client-setup.md)
 
-## 使い方
+## Usage
 
-主な用途は、Claude Code で**リモートの Windows 上の GUI アプリをテストする**こと。典型的な流れは
-——テスト対象（自作の `.exe` など）を**配置して起動** → **コマンドや操作を実行** → **スクショで状態を確認**
-→ **出力やログを回収**。このうち画面を見て座標クリックする所だけ computer use に任せ、残りは loophole が
-SSH コマンド並みのコストでこなす。結果として computer use の往復（スクショ→画像認識→クリック）が減り、
-遅さとトークン消費が下がる。
+The main use is **testing GUI apps on the remote target PC** from Claude Code. The typical flow is:
+**place and launch** the thing under test (your own `.exe` / executable, etc.) → **run commands and
+actions** → **check state with a screenshot** → **collect output and logs**. Of these, only the part
+where you look at the screen and click by coordinate is left to computer use; loophole does the rest at
+roughly the cost of an SSH command. The result is fewer computer-use round trips (screenshot → image
+recognition → click), which lowers both latency and token usage.
 
-## ドキュメント
+## Documentation
 
-**導入・運用**
+**Setup & operation**
 
-| 知りたいこと | ドキュメント |
+| What you want | Document |
 |---|---|
-| インストール（対象 Windows・サーバー側） | [windows-setup.md](docs/windows-setup.md) |
-| インストール（手元機・クライアント側） | [client-setup.md](docs/client-setup.md) |
-| OpenSSH サーバーの導入 | [windows-openssh-server.md](docs/windows-openssh-server.md) |
-| ログオン時にサーバーを自動起動（タスクスケジューラ） | [agent-autostart.md](docs/agent-autostart.md) |
-| 別ユーザーへ代理配備・ヘッドレス運用（上級） | [operator-runbook.md](docs/operator-runbook.md) |
-| アンインストール | [uninstall.md](docs/uninstall.md) |
+| Install (target Windows, server side) | [windows-setup.md](docs/windows-setup.md) |
+| Install (target Linux, server side) | [linux-setup.md](docs/linux-setup.md) |
+| Install (local machine, client side) | [client-setup.md](docs/client-setup.md) |
+| Setting up the OpenSSH server | [windows-openssh-server.md](docs/windows-openssh-server.md) |
+| Auto-start the server at logon (Task Scheduler) | [agent-autostart.md](docs/agent-autostart.md) |
+| Deploying for another user / headless operation (advanced) | [operator-runbook.md](docs/operator-runbook.md) |
+| Uninstall | [uninstall.md](docs/uninstall.md) |
 
-**しくみ・開発**
+**How it works & development**
 
-| 知りたいこと | ドキュメント |
+| What you want | Document |
 |---|---|
-| しくみ・設計（なぜ SSH 越し常駐か／session 0 問題） | [architecture.md](docs/architecture.md) |
-| ライブビュー（操作中の画面を read-only で確認） | [architecture.md](docs/architecture.md) |
-| CLI（`loophole-cli`）の全コマンド | [cli.md](docs/cli.md) |
-| スクショの backend（ddagrab／VNC・RDP の注意） | [vnc-for-computer-use-testing.md](docs/vnc-for-computer-use-testing.md) |
-| 改修・テスト方針 | [dev-notes.md](docs/dev-notes.md) |
+| How it works / design (why SSH-resident / the session 0 problem / Linux support) | [architecture.md](docs/architecture.md) |
+| Live view (watch the screen during operation, read-only) | [architecture.md](docs/architecture.md) |
+| The CLI (`loophole-cli`) and all its commands | [cli.md](docs/cli.md) |
+| The screenshot backend (ddagrab / VNC & RDP notes) | [vnc-for-computer-use-testing.md](docs/vnc-for-computer-use-testing.md) |
+| Modification & testing policy | [dev-notes.md](docs/dev-notes.md) |
 
-## セキュリティ
+## Security
 
-`run` / `shell` / `gui` は任意コード実行に等しい。**ローカルのテスト機専用**で、到達経路は SSH の
-内側（loopback＋ポートフォワード）に限る前提。詳しくは [architecture.md](docs/architecture.md)。
+`run` / `shell` / `gui` are equivalent to arbitrary code execution. They assume a **local test machine
+only**, with the reach path limited to the inside of SSH (loopback + port forwarding). See
+[architecture.md](docs/architecture.md) for details.

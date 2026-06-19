@@ -79,11 +79,12 @@ expect_error(lambda: h.dispatch("run", {}), "run without argv/command raises")
 expect_error(lambda: h.dispatch("run", {"argv": []}), "empty argv raises")
 expect_error(lambda: h.dispatch("run", {"argv": [1, 2]}), "non-string argv raises")
 
-print("run (command -> cmd /S /C):")
+print("run (command -> runner.shell_argv):")
 runner.next_result = ProcessResult(0, b"ok", b"")
 h.dispatch("run", {"command": "echo a & echo b"})
-check_eq(runner.calls[-1]["argv"], ["cmd.exe", "/S", "/C", "echo a & echo b"],
-         "command wrapped in cmd.exe /S /C")
+# ハンドラは OS 分岐を持たず runner.shell_argv に委ねる（FakeRunner は /bin/sh -c を返す）。
+check_eq(runner.calls[-1]["argv"], ["/bin/sh", "-c", "echo a & echo b"],
+         "command wrapped by runner.shell_argv")
 
 print("run (encoding override + failure):")
 runner.next_result = ProcessResult(0, "日本語".encode("utf-8"), b"")
@@ -346,6 +347,37 @@ before = list(menu.invoked)
 out = h.dispatch("menu_invoke", {"title": "メモ帳", "command_id": 9})
 check(out.get("ambiguous") is True, "ambiguous title on invoke returns candidates")
 check_eq(menu.invoked, before, "ambiguous title does not post anything")
+
+print("mouse (move / click / scroll via MouseController):")
+from fakes import FakeMouse  # noqa: E402
+fm = FakeMouse()
+hm = handlers.Handlers(FakeRunner(), FakeClipboard(), FakeScreenshotter(), FakeFS(),
+                       FakeEnv(), FakeKeyboard(), FakeWindowManager(), FakeIme(),
+                       FakeMenuController(), mouse=fm)
+hm.dispatch("mouse_move", {"x": 100, "y": 200})
+check_eq(fm.events[-1], ("move", 100, 200), "mouse_move -> backend.move(x,y)")
+fm.events.clear()
+hm.dispatch("mouse_click", {"button": "right", "x": 10, "y": 20, "count": 2})
+check_eq(fm.events,
+         [("move", 10, 20), ("button", 3, True), ("button", 3, False),
+          ("button", 3, True), ("button", 3, False)],
+         "click right at (10,20) x2 -> move + two down/up of button 3")
+fm.events.clear()
+hm.dispatch("mouse_click", {})
+check_eq(fm.events, [("button", 1, True), ("button", 1, False)],
+         "default click = left, no move, single")
+fm.events.clear()
+hm.dispatch("mouse_scroll", {"dy": 3})
+check_eq(fm.events[-1], ("scroll", 0, 3), "mouse_scroll dy -> backend.scroll(0,3)")
+expect_error(lambda: hm.dispatch("mouse_move", {"x": 1}), "mouse_move missing y -> error")
+expect_error(lambda: hm.dispatch("mouse_click", {"button": "nope"}), "bad button name -> error")
+expect_error(lambda: hm.dispatch("mouse_scroll", {}), "scroll with no dx/dy -> error")
+# mouse 未注入（mouse=None）→ 明示エラー
+hn = handlers.Handlers(FakeRunner(), FakeClipboard(), FakeScreenshotter(), FakeFS(),
+                       FakeEnv(), FakeKeyboard(), FakeWindowManager(), FakeIme(),
+                       FakeMenuController())
+expect_error(lambda: hn.dispatch("mouse_move", {"x": 1, "y": 2}),
+             "mouse unavailable (mouse=None) -> HandlerError")
 
 print(f"\n{'ALL PASS' if failures == 0 else 'SOME FAILED'} ({failures} failure(s))")
 sys.exit(0 if failures == 0 else 1)

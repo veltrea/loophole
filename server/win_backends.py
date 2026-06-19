@@ -1,68 +1,43 @@
-"""win_backends.py — handlers.py のインターフェースの実装（実 OS 版）。
+"""win_backends.py — handlers.py のインターフェースの Windows 実装（Win32 を ctypes 直叩き）。
 
-Windows では:
-  - Runner       : subprocess（コマンドラインは UTF-8→そのまま、出力は生バイト捕捉）
+Windows 固有の能力だけをここに置く:
   - Clipboard    : Win32 CF_UNICODETEXT を ctypes 直叩き（対話セッションで動く＝IME を通らない）
-  - Screenshotter: BitBlt + GDI を ctypes 直叩きで全画面 PNG（自作エンコーダ）。任意で
-                   FFmpeg ddagrab（DXGI Desktop Duplication）に切替＝GPU 描画も撮れる
-  - FileSystem   : 普通の open（バイナリ）
-  - Environment  : ProcessIdToSessionId などでセッション/対話判定
+  - Screenshotter: BitBlt + GDI を ctypes 直叩きで全画面 PNG。任意で FFmpeg ddagrab
+                   （DXGI Desktop Duplication）に切替＝GPU 描画も撮れる
+  - KeyboardSender / WindowManager / ImeController / MenuController : SendInput・EnumWindows・
+    IMM32・GetMenu を ctypes 直叩き（MenuController はクラシック HMENU を担当。HMENU を
+    持たないモダンアプリ＝WPF/WinForms/UWP 等は win_uia_menu の UIA フォールバックに回す）
 
-非 Windows でも import できるように（プロセス起動・ファイルは共通実装が動く）、
-Windows 専用の clipboard/screenshot は呼ばれたときだけ Win32 を触る。PowerShell には
-一切依存しない（撮影パイプラインの純ロジックは Mac でも単体テストできる）。
+OS 非依存の Runner / FileSystem / Environment は common_backends に、撮影の画素変換・PNG
+符号化は imaging に切り出してある（双方を Linux backend と共有する）。非 Windows でも
+import できるように、Win32 専用クラスの __init__ は呼ばれたときだけ windll を触る。
+PowerShell には一切依存しない。
 """
 
 from __future__ import annotations
 
-import binascii
 import ctypes
 import os
-import struct
-import subprocess
 import sys
 import tempfile
 import time
 import uuid
-import zlib
 from ctypes import wintypes
 from typing import Any, Dict, List, Optional
 
-from handlers import ProcessResult
+from common_backends import (
+    HostEnvironment,
+    LocalFileSystem,
+    SubprocessRunner,
+    UnsupportedBackend,
+)
+# 撮影パイプラインの純関数は imaging に集約。テスト（test_win_backends）が参照する
+# 旧称（_bgra_to_rgb / _encode_png / _grab_to_png）を別名で温存する。
+from imaging import bgra_to_rgb as _bgra_to_rgb
+from imaging import encode_png as _encode_png
+from imaging import grab_to_png as _grab_to_png
 
 IS_WINDOWS = sys.platform == "win32"
-
-# 子プロセスにコンソール窓を出さないフラグ（Windows のみ）
-_CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
-
-
-class SubprocessRunner:
-    def run(self, argv: List[str], cwd: Optional[str], timeout: Optional[float],
-            stdin_text: Optional[str]) -> ProcessResult:
-        try:
-            proc = subprocess.Popen(
-                argv,
-                cwd=cwd,
-                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        except (FileNotFoundError, OSError):
-            return ProcessResult(-1, b"", b"", started=False)
-        try:
-            stdin_bytes = stdin_text.encode("utf-8") if stdin_text is not None else None
-            out, err = proc.communicate(input=stdin_bytes, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
-            return ProcessResult(proc.returncode or 124, out or b"", err or b"")
-        return ProcessResult(proc.returncode, out or b"", err or b"")
-
-    def spawn(self, argv: List[str], cwd: Optional[str]) -> int:
-        # GUI/常駐を起動して即返す。エージェントが対話セッションにいるので画面に出る。
-        proc = subprocess.Popen(argv, cwd=cwd, close_fds=True)
-        return proc.pid
 
 
 # ---- クリップボード: Win32 CF_UNICODETEXT を ctypes 直叩き ---------------------
@@ -244,40 +219,8 @@ class _BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 1)]
 
 
-def _bgra_to_rgb(bgra, width: int, height: int) -> bytes:
-    """トップダウン BGRA バッファを RGB バイト列へ（拡張スライス代入＝C 速度）。
-
-    フル画面は数千万バイト。ピクセル単位の Python ループは厳禁。アルファは BitBlt
-    では不定なので捨てる（PNG は color type 2 = RGB）。Mac でも単体テストできる純関数。
-    """
-    src = bytes(bgra)
-    rgb = bytearray(width * height * 3)
-    rgb[0::3] = src[2::4]  # R ← BGRA の R
-    rgb[1::3] = src[1::4]  # G
-    rgb[2::3] = src[0::4]  # B
-    return bytes(rgb)
-
-
-def _encode_png(width: int, height: int, rgb: bytes) -> bytes:
-    """RGB バイト列（行優先・トップダウン）を PNG にする。stdlib(zlib) のみ。純関数。"""
-    def chunk(typ: bytes, data: bytes) -> bytes:
-        return (struct.pack(">I", len(data)) + typ + data +
-                struct.pack(">I", binascii.crc32(typ + data) & 0xFFFFFFFF))
-
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8bit, RGB(=2)
-    stride = width * 3
-    raw = bytearray()
-    for y in range(height):
-        raw.append(0)  # 各スキャンラインの先頭にフィルタ種別 0（None）
-        raw += rgb[y * stride:(y + 1) * stride]
-    idat = zlib.compress(bytes(raw), 6)
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) +
-            chunk(b"IDAT", idat) + chunk(b"IEND", b""))
-
-
-def _grab_to_png(width: int, height: int, bgra) -> bytes:
-    """撮影した BGRA（トップダウン）を PNG バイト列にする純パイプライン。"""
-    return _encode_png(width, height, _bgra_to_rgb(bgra, width, height))
+# 撮影パイプラインの純関数（_bgra_to_rgb / _encode_png / _grab_to_png）は imaging に移設し、
+# モジュール冒頭で同名の別名として import 済み（BitBltScreenshotter.capture が _grab_to_png を使う）。
 
 
 class BitBltScreenshotter:
@@ -723,22 +666,23 @@ class _MENUITEMINFOW(ctypes.Structure):
     ]
 
 
-class Win32MenuController:
+class _ClassicMenuController:
     """クラシック Win32 メニューバーを列挙し、コマンドを WM_COMMAND で発火する。Windows 専用。
 
     GetMenu(hwnd) でメニューバーを取り、GetMenuItemInfoW で各項目（ラベル・wID・状態・
     サブメニュー）を読む。発火はメニューを開かず PostMessage(WM_COMMAND, wID) を投げるだけで、
-    キー操作不要・ブラインド・決定的。リボン/Electron/UWP は GetMenu が NULL を返すので
-    enumerate は None（= handlers 側で supported:false）になる。
+    キー操作不要・ブラインド・決定的。リボン/Electron/UWP/WPF/WinForms は GetMenu が NULL を
+    返すので enumerate は None（→ 上位の Win32MenuController が UIA フォールバックに回す）。
 
+    Win32MenuController（公開クラス）の「1 段目＝高速・ブラインド・副作用なし」の経路。
     ツリー整形・破壊的ラベル判定は handlers 側の純粋ロジックが担うので、ここは生ツリーを
     返すだけ。W 系 API なのでラベルは UTF-16 のまま取れ、CP932 のダメ文字問題と無縁。
     """
 
     def __init__(self):
-        # build_handlers 経由＝実機でのみ呼ばれる。Mac の import 時には評価されない。
+        # Win32MenuController（合成クラス）経由＝実機でのみ生成される。
         if not IS_WINDOWS:
-            raise RuntimeError("Win32MenuController is Windows-only")
+            raise RuntimeError("_ClassicMenuController is Windows-only")
         u = ctypes.windll.user32
         # 64bit では argtypes/restype 必須（HMENU/HWND がポインタ幅。既定 c_int だと壊れる）。
         u.GetMenu.argtypes = [wintypes.HWND]; u.GetMenu.restype = wintypes.HMENU
@@ -813,38 +757,69 @@ class Win32MenuController:
         return bool(u.PostMessageW(h, _WM_COMMAND, command_id & 0xFFFF, 0))
 
 
-class LocalFileSystem:
-    def read_bytes(self, path: str) -> bytes:
-        with open(path, "rb") as f:
-            return f.read()
+class Win32MenuController:
+    """メニュー列挙・発火の Windows 実装（クラシック → UIA の 2 段フォールバック）。Windows 専用。
 
-    def write_bytes(self, path: str, data: bytes) -> None:
-        with open(path, "wb") as f:
-            f.write(data)
+    1 段目（高速・ブラインド・副作用なし）: クラシック Win32 メニューバー（HMENU）を
+    GetMenu/GetMenuItemInfoW で読み、WM_COMMAND を Post して発火する（_ClassicMenuController）。
+    メモ帳・多くのネイティブ Win32 アプリ・FileMaker 等が該当。
 
-    def exists(self, path: str) -> bool:
-        return os.path.exists(path)
+    2 段目（フォールバック）: GetMenu が NULL（HMENU を持たない＝WPF/WinForms/UWP/WinUI 等の
+    モダンアプリ）のとき、UI Automation（アクセシビリティ）でメニューバーを辿る
+    （win_uia_menu.UiaMenuController）。これは Linux の AT-SPI フォールバックと対称の設計。
+    comtypes が要る——無ければ UIA 段は黙って無効化され、従来どおり supported:false を返す
+    （回帰なし）。リボン(Office)/Electron は UIA でも安定しないので best-effort（取れなければ
+    supported:false → スクショ＋マウスに退避）。
 
-    def walk(self, root: str):
-        # os.walk はトップダウン。呼び側が dirnames を破壊的に削れば枝刈りできる。
-        return os.walk(root)
+    invoke は「直近の enumerate がどちらの段で当たったか」を hwnd 単位で覚えて振り分ける。
+    enumerate せず既知の wID を直接 invoke する従来の使い方はクラシック経路に倒す（UIA 段は
+    enumerate で合成 ID を作らないと invoke できないため、Linux backend と同じ前提）。
+    """
 
-    def stat(self, path: str):
-        st = os.stat(path)
-        return st.st_size, st.st_mtime
+    def __init__(self):
+        # build_handlers 経由＝実機でのみ呼ばれる。Mac の import 時には評価されない。
+        if not IS_WINDOWS:
+            raise RuntimeError("Win32MenuController is Windows-only")
+        self._classic = _ClassicMenuController()
+        self._uia = None          # 遅延生成: None=未試行 / False=利用不可 / インスタンス
+        self._uia_hwnds = set()    # 直近 enumerate が UIA 段で当たった hwnd の集合
 
+    def _ensure_uia(self):
+        """UIA backend を遅延生成する。comtypes 不在や COM 初期化失敗なら False を覚えて諦める。
 
-class HostEnvironment:
-    def describe(self) -> Dict[str, Any]:
-        info: Dict[str, Any] = {
-            "platform": sys.platform,
-            "pid": os.getpid(),
-            "cwd": os.getcwd(),
-            "user": os.environ.get("USERNAME") or os.environ.get("USER"),
-        }
-        if IS_WINDOWS:
-            info.update(_windows_session_info())
-        return info
+        win_uia_menu の import は Windows 実機のここでだけ起きる（comtypes 依存をモジュール
+        トップに置かないことで、Mac での import と Mac テストを汚さない）。
+        """
+        if self._uia is None:
+            try:
+                from win_uia_menu import UiaMenuController
+                self._uia = UiaMenuController()
+            except Exception:
+                self._uia = False  # 二度と試さない（毎回 import を試す無駄を避ける）
+        return self._uia or None
+
+    def enumerate(self, hwnd: int) -> Optional[List[Dict[str, Any]]]:
+        # 1 段目: クラシック HMENU。取れたら即返す（最速・副作用なし）。
+        tree = self._classic.enumerate(hwnd)
+        if tree is not None:
+            self._uia_hwnds.discard(hwnd)
+            return tree
+        # 2 段目: HMENU が無い→ UIA フォールバック（comtypes があれば）。
+        uia = self._ensure_uia()
+        if uia is None:
+            return None
+        tree = uia.enumerate(hwnd)
+        if tree is None:
+            self._uia_hwnds.discard(hwnd)
+            return None
+        self._uia_hwnds.add(hwnd)
+        return tree
+
+    def invoke(self, hwnd: int, command_id: int) -> bool:
+        # 直近 enumerate が UIA で当たった hwnd は UIA で発火、それ以外はクラシック。
+        if hwnd in self._uia_hwnds and self._uia:
+            return self._uia.invoke(hwnd, command_id)
+        return self._classic.invoke(hwnd, command_id)
 
 
 # ---- スクリーンショット backend の選択 --------------------------------------
@@ -863,69 +838,74 @@ def _select_screenshotter():
     return BitBltScreenshotter()
 
 
-def _windows_session_info() -> Dict[str, Any]:
-    """現在のプロセスがどのセッションにいて、対話可能かを返す。"""
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        pid = kernel32.GetCurrentProcessId()
-        session_id = ctypes.c_ulong()
-        kernel32.ProcessIdToSessionId(pid, ctypes.byref(session_id))
-        sid = int(session_id.value)
-        # セッション 0 = サービス/非対話。1 以上 = 対話デスクトップ。
-        return {"session_id": sid, "interactive": sid != 0}
-    except Exception as exc:  # pragma: no cover - 実機 Windows でのみ通る
-        return {"session_id": None, "interactive": None, "session_error": str(exc)}
-
-
 def build_screenshotter():
-    """実 OS のスクリーンショッタを単体で組む（viewer.py のライブビューア用）。
+    """Windows のスクリーンショッタを単体で組む（viewer.py のライブビューア用）。
 
     env の LOOPHOLE_SCREENSHOT_BACKEND に従う。撮影方式は状態を持たないので、
     Handlers の内部とは別インスタンスでも問題ない。viewer は capture() しか使わない。
+    backends.build_screenshotter がプラットフォームを見てこれ（or Linux 版）を選ぶ。
     """
     return _select_screenshotter()
 
 
-class _NonWindowsStub:
-    """非 Windows で build_handlers を構築可能にするための番人。
+class Win32Mouse:
+    """SetCursorPos と mouse_event でカーソル移動・ボタン・ホイールを送る。Windows 専用。
 
-    Win32 専用バックエンド（clipboard/screenshot/keyboard/windows/ime）の __init__ は
-    Windows 以外だと raise する。Mac での結合テスト（tests/test_e2e_loopback.py）は
-    POSIX で動く run/read_file/write_file 系だけを検証するので、Win32 系はこのスタブに
-    差し替えて「構築は通すが、呼ばれたときだけ明示エラー」にする。
+    対話デスクトップセッションに常駐するエージェントから呼ぶ前提。座標は物理ピクセル
+    （screenshot と同じ仮想スクリーン座標系）。mouse_event は古い API だが自動化には十分。
     """
 
-    def __getattr__(self, name):
-        def _unavailable(*args, **kwargs):
-            raise RuntimeError(f"{name}: Win32-only backend is unavailable on this platform")
-        return _unavailable
+    _DOWN = {1: 0x0002, 2: 0x0020, 3: 0x0008}  # LEFT/MIDDLE/RIGHT DOWN
+    _UP = {1: 0x0004, 2: 0x0040, 3: 0x0010}    # LEFT/MIDDLE/RIGHT UP
+    _WHEEL = 0x0800
+    _HWHEEL = 0x1000
+    _WHEEL_DELTA = 120
+
+    def __init__(self):
+        if not IS_WINDOWS:
+            raise RuntimeError("Win32Mouse is Windows-only")
+        _ensure_dpi_aware()  # 物理ピクセルで動かす（screenshot と座標系を揃える）
+        u = ctypes.windll.user32
+        u.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        u.SetCursorPos.restype = wintypes.BOOL
+        u.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.DWORD, _ULONG_PTR]
+        u.mouse_event.restype = None
+        self._u = u
+
+    def move(self, x: int, y: int) -> None:
+        self._u.SetCursorPos(int(x), int(y))
+
+    def button(self, button: int, down: bool) -> None:
+        flags = (self._DOWN if down else self._UP).get(int(button))
+        if flags is None:
+            raise RuntimeError(f"Win32Mouse: unsupported button {button}")
+        self._u.mouse_event(flags, 0, 0, 0, 0)
+
+    def scroll(self, dx: int, dy: int) -> None:
+        # dy>0 = 下方向（WHEEL は上が正なので符号反転）。dx>0 = 右。signed を DWORD に詰める。
+        if dy:
+            self._u.mouse_event(self._WHEEL, 0, 0, (-self._WHEEL_DELTA * dy) & 0xFFFFFFFF, 0)
+        if dx:
+            self._u.mouse_event(self._HWHEEL, 0, 0, (self._WHEEL_DELTA * dx) & 0xFFFFFFFF, 0)
 
 
 def build_handlers():
-    """実 OS バックエンドで Handlers を組み立てる。
+    """Windows backend で Handlers を組み立てる（backends.build_handlers が win32 で呼ぶ）。
 
-    Win32 専用バックエンドは Windows でのみ構築する。非 Windows では _NonWindowsStub に
-    差し替えて build_handlers 自体は成功させる（POSIX コマンドの結合テストを Mac で回す）。
+    OS 非依存の Runner / FileSystem / Environment は common_backends から、Win32 専用の
+    clipboard/screenshot/keyboard/windows/ime/menu/mouse はこのモジュールから組む。
     """
     from handlers import Handlers
-    if IS_WINDOWS:
-        clipboard = Win32Clipboard()
-        screenshotter = _select_screenshotter()
-        keyboard = SendInputKeyboard()
-        windows = Win32WindowManager()
-        ime = Win32ImeController()
-        menu = Win32MenuController()
-    else:
-        clipboard = screenshotter = keyboard = windows = ime = menu = _NonWindowsStub()
     return Handlers(
         runner=SubprocessRunner(),
-        clipboard=clipboard,
-        screenshotter=screenshotter,
+        clipboard=Win32Clipboard(),
+        screenshotter=_select_screenshotter(),
         filesystem=LocalFileSystem(),
         environment=HostEnvironment(),
-        keyboard=keyboard,
-        windows=windows,
-        ime=ime,
-        menu=menu,
+        keyboard=SendInputKeyboard(),
+        windows=Win32WindowManager(),
+        ime=Win32ImeController(),
+        menu=Win32MenuController(),
+        mouse=Win32Mouse(),
     )

@@ -1,0 +1,14 @@
+# Optional dependencies for the loophole agent (server side).
+#
+# The agent runs on stdlib alone for its core. These packages unlock extra,
+# best-effort capabilities; install them on the target host only if you want them.
+# If absent, the related feature degrades gracefully (it reports "unsupported"
+# and the agent keeps working) — nothing else breaks.
+#
+#   pip install -r requirements-optional.txt
+#
+# comtypes: pure-Python COM wrapper used by the Windows menu UIA fallback
+#   (win_uia_menu.py). Lets loophole_menu enumerate/invoke menus of modern apps
+#   that have no classic Win32 menu bar (WPF / WinForms / UWP / WinUI). Without
+#   it, only classic HMENU menu bars are supported (Notepad, many native apps).
+comtypes>=1.2.0 ; sys_platform == "win32"

@@ -22,6 +22,10 @@ class FakeRunner:
         self.spawned.append({"argv": argv, "cwd": cwd})
         return self.next_pid
 
+    def shell_argv(self, command):
+        # 実 backend と同じく POSIX のシェルラッパを返す（OS に依らず決定的に検証する）。
+        return ["/bin/sh", "-c", command]
+
 
 class FakeClipboard:
     def __init__(self):
@@ -127,6 +131,21 @@ class FakeIme:
         self.state = (cur_open, cur_conv)
         self.sets.append((open, conversion))
         return True
+
+
+class FakeMouse:
+    def __init__(self):
+        # 呼ばれた操作を順に記録する: ("move", x, y) / ("button", num, down) / ("scroll", dx, dy)
+        self.events = []
+
+    def move(self, x, y):
+        self.events.append(("move", x, y))
+
+    def button(self, button, down):
+        self.events.append(("button", button, down))
+
+    def scroll(self, dx, dy):
+        self.events.append(("scroll", dx, dy))
 
 
 class FakeMenuController:

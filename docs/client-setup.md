@@ -1,7 +1,8 @@
 # loophole クライアント セットアップ（手元機側）
 
 手元機（Mac など）に loophole クライアントを置き、Claude Code から使えるようにする手順。
-対象 Windows 側のサーバーは別途 [windows-setup.md](windows-setup.md) で常駐させておくこと。
+対象 PC 側のサーバーは別途、Windows なら [windows-setup.md](windows-setup.md)、Linux なら
+[linux-setup.md](linux-setup.md) で常駐させておくこと。
 
 > **コマンドに不慣れでも大丈夫。** このページを Claude（いま使っている AI）に渡して
 > 「この手順どおり loophole をセットアップして」と頼めば、下のコマンドを順に実行してくれる。
@@ -51,7 +52,7 @@ claude mcp add loophole -- loophole
 
 Claude に **「loophole の設定をして」** と頼むだけ。Claude が、ふつうの言葉で順に聞いてくる:
 
-- **操作したい Windows PC の IP アドレス**（例: `192.168.1.x`。Windows の 設定→ネットワークとインターネット で確認できる）
+- **操作したい PC の IP アドレス**（例: `192.168.1.x`。Windows なら 設定→ネットワークとインターネット、Linux なら `ip a` で確認できる）
 - **その PC でのあなたのユーザー名**（サインインに使う名前）
 
 答えると、Claude が `loophole_configure` を呼び、**接続テスト → 設定保存（`~/.loophole/config`）→ トンネル開通 → 疎通確認**まで自動でやって、結果を返す。SSH 鍵や踏み台といった専門設定は聞かれない（既定で動く・繋がらなければ回避設定を裏で自動で試す）。ターミナルに戻る必要はない。
@@ -63,17 +64,18 @@ Claude に **「loophole の設定をして」** と頼むだけ。Claude が、
 ## これで完了 — ふだんは Claude を使うだけ
 
 設定はここまで（手順は手順4で終わり）。**以降、手元機で毎回やる操作は無い。** Claude が loophole の
-ツールを呼ぶと、MCP サーバーが自動で立ち上がって SSH トンネルを張り（終了時に畳む）、対象 Windows に
-繋ぐ。前提は「対象 Windows 側で loophole サーバーが起動していること」だけ。
+ツールを呼ぶと、MCP サーバーが自動で立ち上がって SSH トンネルを張り（終了時に畳む）、対象 PC に
+繋ぐ。前提は「対象 PC 側で loophole サーバーが起動していること」だけ。
 
 ちゃんと繋がっているか確かめたいとき（任意）は、Claude に `loophole_hello` を呼んでもらう
-（`session_id` 1 以上・`interactive: true` なら OK）。最初の一手として「対象 Windows でメモ帳を起動して
+（`interactive: true` なら OK。Windows は `session_id` 1 以上、Linux は `display_server` が x11/wayland）。
+最初の一手として「対象 PC でアプリ（Windows ならメモ帳、Linux ならテキストエディタ）を起動して
 スクショを見せて」と頼むと、相手の画面にそれが出て画像が返ってくる。
 
 ---
 
-うまくいかないときは、まず対象 Windows 側（[windows-setup.md](windows-setup.md) のトラブルシュート）で
-サーバーが対話セッションで動いているかを確認する。
+うまくいかないときは、まず対象 PC 側（Windows は [windows-setup.md](windows-setup.md)、Linux は
+[linux-setup.md](linux-setup.md) のトラブルシュート）で、サーバーが対話セッションで動いているかを確認する。
 
 ### 手で設定する場合（任意）
 

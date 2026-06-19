@@ -92,5 +92,48 @@ print("normalize (display only, no parsing):")
 check_eq(keys.normalize("win+r enter"), ["win+r", "enter"], "string split on whitespace")
 check_eq(keys.normalize(["a", "b"]), ["a", "b"], "list passed through")
 
+print("KEYSYM table (X11) sanity:")
+check_eq(keys.KEYSYM["a"], 0x61, "a -> keysym 0x61 (ASCII lowercase)")
+check_eq(keys.KEYSYM["z"], 0x7A, "z -> keysym 0x7A")
+check_eq(keys.KEYSYM["0"], 0x30, "0 -> keysym 0x30")
+check_eq(keys.KEYSYM["space"], 0x20, "space -> keysym 0x20")
+check_eq(keys.KEYSYM["enter"], 0xFF0D, "enter -> XK_Return")
+check_eq(keys.KEYSYM["esc"], 0xFF1B, "esc -> XK_Escape")
+check_eq(keys.KEYSYM["f1"], 0xFFBE, "f1 -> XK_F1")
+check_eq(keys.KEYSYM["f24"], 0xFFBE + 23, "f24 -> XK_F1+23")
+check_eq(keys.KEYSYM["up"], 0xFF52, "up -> XK_Up")
+check_eq(keys.KEYSYM["ctrl"], 0xFFE3, "ctrl -> XK_Control_L")
+check_eq(keys.KEYSYM["win"], 0xFFEB, "win -> XK_Super_L")
+
+print("VK_TO_KEYSYM (Windows VK -> X11 keysym) for the codes the keyboard backend sees:")
+# parse_chord は VK を吐く。その VK が keysym に解決できることを確かめる（X11Keyboard が引く経路）。
+check_eq(keys.VK_TO_KEYSYM[keys.VK["a"]], 0x61, "VK 'A'(0x41) -> keysym 'a'(0x61)")
+check_eq(keys.VK_TO_KEYSYM[keys.VK["s"]], 0x73, "VK 'S' -> keysym 's'")
+check_eq(keys.VK_TO_KEYSYM[VK_CTRL], 0xFFE3, "VK_CTRL -> XK_Control_L")
+check_eq(keys.VK_TO_KEYSYM[VK_SHIFT], 0xFFE1, "VK_SHIFT -> XK_Shift_L")
+check_eq(keys.VK_TO_KEYSYM[VK_WIN], 0xFFEB, "VK_WIN -> XK_Super_L")
+check_eq(keys.VK_TO_KEYSYM[VK_ENTER], 0xFF0D, "VK_ENTER -> XK_Return")
+# 別名（control/cmd 等）が同じ VK を指しても矛盾しない（同一 keysym に解決）。
+check_eq(keys.VK["ctrl"], keys.VK["control"], "ctrl/control share one VK")
+# parse_chord が返す全 VK が VK_TO_KEYSYM に存在する（未マッピングで送信時に落ちない保証）。
+_seq = keys.parse_sequence("ctrl+shift+s win+r enter alt+f4 up tab")
+_all_vks = {vk for mods, main in _seq for vk in (list(mods) + [main])}
+check(all(vk in keys.VK_TO_KEYSYM for vk in _all_vks),
+      "every VK a chord can produce has a keysym mapping")
+
+print("VK_TO_EVDEV (Windows VK -> Linux evdev code, for Wayland ydotool):")
+check_eq(keys.EVDEV["a"], 30, "a -> KEY_A (30)")
+check_eq(keys.EVDEV["s"], 31, "s -> KEY_S (31)")
+check_eq(keys.EVDEV["ctrl"], 29, "ctrl -> KEY_LEFTCTRL (29)")
+check_eq(keys.EVDEV["enter"], 28, "enter -> KEY_ENTER (28)")
+check_eq(keys.EVDEV["f1"], 59, "f1 -> KEY_F1 (59)")
+check_eq(keys.EVDEV["f12"], 88, "f12 -> KEY_F12 (88)")
+check_eq(keys.EVDEV["1"], 2, "digit 1 -> KEY_1 (2)")
+check_eq(keys.EVDEV["0"], 11, "digit 0 -> KEY_0 (11)")
+check_eq(keys.VK_TO_EVDEV[keys.VK["s"]], 31, "VK 'S' -> evdev KEY_S")
+check_eq(keys.VK_TO_EVDEV[VK_CTRL], 29, "VK_CTRL -> KEY_LEFTCTRL")
+check(all(vk in keys.VK_TO_EVDEV for vk in _all_vks),
+      "every VK a chord can produce has an evdev mapping too")
+
 print(f"\n{'ALL PASS' if failures == 0 else 'SOME FAILED'} ({failures} failure(s))")
 sys.exit(0 if failures == 0 else 1)

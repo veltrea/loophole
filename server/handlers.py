@@ -45,6 +45,13 @@ class Runner(Protocol):
         """GUI/常駐プロセスを起動して即座に PID を返す（出力は捕捉しない）。"""
         ...
 
+    def shell_argv(self, command: str) -> List[str]:
+        """シェルワンライナーを実行するための argv を、ホスト OS のシェルで組む。
+
+        Windows なら cmd.exe、POSIX なら /bin/sh。どのシェルで包むかは実行 backend の
+        責務なので、ハンドラは OS 分岐を持たずこれを呼ぶだけにする。"""
+        ...
+
 
 class Clipboard(Protocol):
     def get(self) -> str: ...
@@ -120,6 +127,24 @@ class MenuController(Protocol):
     def invoke(self, hwnd: int, command_id: int) -> bool:
         """command_id を WM_COMMAND として hwnd に Post する。送れたら True。"""
         ...
+
+
+class MouseController(Protocol):
+    def move(self, x: int, y: int) -> None:
+        """カーソルを画面の絶対座標 (x, y) へ動かす。"""
+        ...
+
+    def button(self, button: int, down: bool) -> None:
+        """ボタン（1=左 / 2=中 / 3=右）を押す（down=True）/離す（down=False）。"""
+        ...
+
+    def scroll(self, dx: int, dy: int) -> None:
+        """ホイールスクロール。dy>0 で下方向、dx>0 で右方向（クリック数）。"""
+        ...
+
+
+# ボタン名 → 番号（1=左 / 2=中 / 3=右）。computer use 等と揃えた一般的な対応。
+_MOUSE_BUTTONS = {"left": 1, "middle": 2, "right": 3}
 
 
 # ---- IME 変換モードのビットフラグ（IMM32 の IME_CMODE_*）---------------------
@@ -232,7 +257,7 @@ class Handlers:
                  screenshotter: Screenshotter, filesystem: FileSystem,
                  environment: Environment, keyboard: KeyboardSender,
                  windows: WindowManager, ime: ImeController,
-                 menu: MenuController):
+                 menu: MenuController, mouse: Optional[MouseController] = None):
         self._runner = runner
         self._clipboard = clipboard
         self._screenshot = screenshotter
@@ -242,6 +267,8 @@ class Handlers:
         self._windows = windows
         self._ime = ime
         self._menu = menu
+        # mouse は後付けの能力なので任意。未注入なら mouse_* は明示エラーにする。
+        self._mouse = mouse
 
     def dispatch(self, cmd: str, args: Dict[str, Any]) -> Any:
         handler: Optional[Callable[[Dict[str, Any]], Any]] = self._table().get(cmd)
@@ -271,6 +298,9 @@ class Handlers:
             "ime_set": self._ime_set,
             "menu_enumerate": self._menu_enumerate,
             "menu_invoke": self._menu_invoke,
+            "mouse_move": self._mouse_move,
+            "mouse_click": self._mouse_click,
+            "mouse_scroll": self._mouse_scroll,
         }
 
     # ping / hello は疎通とセッション情報の確認用
@@ -306,8 +336,9 @@ class Handlers:
             command = args["command"]
             if not isinstance(command, str):
                 raise HandlerError("'command' must be a string")
-            # Windows のシェルワンライナー。/S /C は最外の引用を 1 組だけ外す。
-            argv = ["cmd.exe", "/S", "/C", command]
+            # ホスト OS のシェルで包む（Windows=cmd.exe /S /C、POSIX=/bin/sh -c）。
+            # 実際のシェル選択は実行 backend（Runner.shell_argv）に委ねる。
+            argv = self._runner.shell_argv(command)
         else:
             raise HandlerError("run requires 'argv' or 'command'")
 
@@ -667,6 +698,78 @@ class Handlers:
                 f"could not post command_id={command_id} to hwnd={hwnd} "
                 f"(no such window, or it has no menu)")
         return {"posted": True, "hwnd": hwnd, "command_id": command_id}
+
+    # ---- マウス（move/click/scroll）-----------------------------------------
+    #
+    # 文字入力やショートカットを越えて「座標を触る」操作。computer use の領域だが、
+    # 単純なクリック/移動/スクロールはこちらで代行できると往復が減る。座標は画面の
+    # 絶対ピクセル（screenshot と同じ仮想スクリーン座標系）。
+
+    def _require_mouse(self):
+        if self._mouse is None:
+            raise HandlerError("mouse control is not available on this agent")
+        return self._mouse
+
+    @staticmethod
+    def _coord(args: Dict[str, Any], key: str) -> int:
+        v = args.get(key)
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise HandlerError(f"mouse requires integer '{key}'")
+        return v
+
+    @staticmethod
+    def _button(args: Dict[str, Any]) -> Tuple[int, str]:
+        """args の button（名前 'left'/'middle'/'right' か 1..3）を (番号, 名前) にする。"""
+        b = args.get("button", "left")
+        if isinstance(b, str):
+            num = _MOUSE_BUTTONS.get(b.lower())
+            if num is None:
+                raise HandlerError("mouse 'button' must be left/middle/right")
+            return num, b.lower()
+        if isinstance(b, int) and not isinstance(b, bool) and 1 <= b <= 3:
+            name = {1: "left", 2: "middle", 3: "right"}[b]
+            return b, name
+        raise HandlerError("mouse 'button' must be left/middle/right (or 1..3)")
+
+    def _mouse_move(self, args: Dict[str, Any]) -> Any:
+        """カーソルを絶対座標 (x, y) へ動かす。"""
+        mouse = self._require_mouse()
+        x, y = self._coord(args, "x"), self._coord(args, "y")
+        mouse.move(x, y)
+        return {"moved": True, "x": x, "y": y}
+
+    def _mouse_click(self, args: Dict[str, Any]) -> Any:
+        """クリックする。x/y があればそこへ移動してから。count で連打（ダブルクリック等）。
+
+        args:
+          button : "left"(既定) / "middle" / "right"
+          x, y   : 省略可。指定すればクリック前に移動する
+          count  : 連打回数（既定 1。ダブルクリックは 2）
+        """
+        mouse = self._require_mouse()
+        num, name = self._button(args)
+        if "x" in args or "y" in args:
+            mouse.move(self._coord(args, "x"), self._coord(args, "y"))
+        count = args.get("count", 1)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise HandlerError("mouse_click 'count' must be a positive integer")
+        for _ in range(count):
+            mouse.button(num, True)
+            mouse.button(num, False)
+        return {"clicked": count, "button": name}
+
+    def _mouse_scroll(self, args: Dict[str, Any]) -> Any:
+        """ホイールスクロール。dy>0 で下、dx>0 で右（クリック数）。"""
+        mouse = self._require_mouse()
+        dx = args.get("dx", 0)
+        dy = args.get("dy", 0)
+        for v, axis in ((dx, "dx"), (dy, "dy")):
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise HandlerError(f"mouse_scroll '{axis}' must be an integer")
+        if dx == 0 and dy == 0:
+            raise HandlerError("mouse_scroll requires a non-zero 'dx' or 'dy'")
+        mouse.scroll(dx, dy)
+        return {"scrolled": True, "dx": dx, "dy": dy}
 
 
 def _join(dirpath: str, name: str) -> str:
