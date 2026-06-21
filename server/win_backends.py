@@ -348,6 +348,7 @@ _ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.
 _INPUT_KEYBOARD = 1
 _KEYEVENTF_EXTENDEDKEY = 0x0001
 _KEYEVENTF_KEYUP = 0x0002
+_KEYEVENTF_UNICODE = 0x0004  # wScan を Unicode コードユニットとして注入（配列も IME も通さない）
 
 # 拡張キー（E0 プレフィクス）。EXTENDEDKEY を立てないと一部アプリで効かない/
 # テンキー側と混同される（矢印・編集キー・Win・Apps・PrintScreen）。
@@ -415,6 +416,35 @@ class SendInputKeyboard:
         for vk in reversed(modifiers):
             self._emit(vk, down=False)
 
+    def type_text(self, text: str) -> None:
+        """文字列を 1 文字ずつ Unicode キーイベントとして打ち込む（KEYEVENTF_UNICODE）。
+
+        wVk=0・wScan=UTF-16 コードユニットで送ると、Windows はキーボード配列も IME も
+        通さずにその文字を前面ウィンドウへ届ける（WM_CHAR 相当）。ゆえに日本語でも
+        化けずに打てる——send_keys（和音）が「文字入力には使うな」なのと対照的に、
+        こちらが loophole の正規の文字タイプ経路。BMP 外は UTF-16 サロゲートペアに分割。
+        """
+        if not IS_WINDOWS:
+            raise RuntimeError("key send is Windows-only")
+        for u in self._utf16_units(text):
+            self._emit_unicode(u, down=True)
+            self._emit_unicode(u, down=False)
+
+    @staticmethod
+    def _utf16_units(text: str) -> List[int]:
+        """文字列を UTF-16 コードユニット（16bit 整数）の並びにする。BMP 外はサロゲート対。"""
+        raw = text.encode("utf-16-le")
+        return [raw[i] | (raw[i + 1] << 8) for i in range(0, len(raw), 2)]
+
+    def _emit_unicode(self, unit: int, down: bool) -> None:
+        flags = _KEYEVENTF_UNICODE | (0 if down else _KEYEVENTF_KEYUP)
+        ki = _KEYBDINPUT(wVk=0, wScan=unit, dwFlags=flags, time=0, dwExtraInfo=0)
+        inp = _INPUT(type=_INPUT_KEYBOARD, u=_INPUTUNION(ki=ki))
+        sent = ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+        if sent != 1:
+            err = ctypes.windll.kernel32.GetLastError()
+            raise RuntimeError(f"SendInput failed for unicode={unit:#06x} (GetLastError={err})")
+
     def _emit(self, vk: int, down: bool) -> None:
         flags = 0 if down else _KEYEVENTF_KEYUP
         if vk in _EXTENDED_VKS:
@@ -432,6 +462,14 @@ class SendInputKeyboard:
 _VK_MENU = 0x12  # Alt（フォアグラウンドロック解除トリック用）
 _SW_SHOW = 5
 _SW_RESTORE = 9
+_SW_MAXIMIZE = 3
+_SW_MINIMIZE = 6
+
+# SetWindowPos フラグ（位置のみ/サイズのみ指定や z-order・アクティブ化抑止）。
+_SWP_NOSIZE = 0x0001
+_SWP_NOMOVE = 0x0002
+_SWP_NOZORDER = 0x0004
+_SWP_NOACTIVATE = 0x0010
 
 
 def _configure_user32():
@@ -457,6 +495,11 @@ def _configure_user32():
     u.SetForegroundWindow.argtypes = [wintypes.HWND]; u.SetForegroundWindow.restype = wintypes.BOOL
     u.BringWindowToTop.argtypes = [wintypes.HWND]; u.BringWindowToTop.restype = wintypes.BOOL
     u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]; u.ShowWindow.restype = wintypes.BOOL
+    u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    u.SetWindowPos.restype = wintypes.BOOL
+    u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    u.GetWindowRect.restype = wintypes.BOOL
     u.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
     u.AttachThreadInput.restype = wintypes.BOOL
     u.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, _ULONG_PTR]
@@ -538,6 +581,57 @@ class Win32WindowManager:
                 u.AttachThreadInput(cur_tid, fg_tid, False)
         # 実際に前面へ来たかを最終確認する（点滅だけして失敗するケースを弾く）。
         return bool(u.GetForegroundWindow() == hwnd)
+
+    def set_window(self, hwnd: int, position=None, size=None,
+                   minimized: Optional[bool] = None, fullscreen: Optional[bool] = None,
+                   maximized: Optional[bool] = None, raise_: Optional[bool] = None) -> Dict[str, Any]:
+        """HWND の窓の位置/サイズ/最小化/最大化/前面化を設定し、適用後 state を返す。
+
+        position=(x,y) / size=(w,h) は None=触らない。minimized/maximized/raise_ は bool or None。
+        座標は**物理ピクセル**（_ensure_dpi_aware 済み・screenshot/mouse と同系）。適用順は macOS と
+        揃える: raise → maximize → position → size → (fullscreen) → minimize。
+
+        **Windows に OS レベルの全画面は無い**（F11 はアプリ固有）。maximize で代用して
+        「fullscreen 成功」と返すのは偽陽性なので捏造しない——fullscreen 引数は受けるが反映せず、
+        readback の "fullscreen" は常に False。窓が見つからなければ actionable な RuntimeError。
+        """
+        u = self._u
+        h = wintypes.HWND(hwnd)
+        if not u.IsWindow(h):
+            raise RuntimeError(
+                f"no window with handle {hwnd} (it may have closed; "
+                "re-run list_windows to get a current handle)")
+        if raise_:
+            self.activate(hwnd)  # AttachThreadInput 込みの前面化を再利用
+        if maximized:
+            u.ShowWindow(h, _SW_MAXIMIZE)  # macOS/protocol と同じく True のときだけ作用
+        if position is not None or size is not None:
+            x = int(position[0]) if position is not None else 0
+            y = int(position[1]) if position is not None else 0
+            w = int(size[0]) if size is not None else 0
+            ht = int(size[1]) if size is not None else 0
+            flags = _SWP_NOZORDER | _SWP_NOACTIVATE
+            if position is None:
+                flags |= _SWP_NOMOVE  # 移動せずリサイズだけ
+            if size is None:
+                flags |= _SWP_NOSIZE  # サイズを変えず移動だけ
+            u.SetWindowPos(h, wintypes.HWND(0), x, y, w, ht, flags)
+        # fullscreen は捏造しない（Windows に OS 全画面は無い）。引数は受けるが反映しない。
+        if minimized is not None:
+            u.ShowWindow(h, _SW_MINIMIZE if minimized else _SW_RESTORE)
+        return self._read_state(h)
+
+    def _read_state(self, h) -> Dict[str, Any]:
+        """GetWindowRect で実測 geometry、IsIconic で最小化を読む。fullscreen は常に False。"""
+        u = self._u
+        rect = wintypes.RECT()
+        u.GetWindowRect(h, ctypes.pointer(rect))
+        return {
+            "x": int(rect.left), "y": int(rect.top),
+            "width": int(rect.right - rect.left), "height": int(rect.bottom - rect.top),
+            "minimized": bool(u.IsIconic(h)),
+            "fullscreen": False,  # Windows に OS レベルの全画面は無い
+        }
 
 
 # ---- Win32 IMM32 で前面ウィンドウの IME 状態を読み書きする（ctypes）---------
@@ -888,6 +982,21 @@ class Win32Mouse:
             self._u.mouse_event(self._WHEEL, 0, 0, (-self._WHEEL_DELTA * dy) & 0xFFFFFFFF, 0)
         if dx:
             self._u.mouse_event(self._HWHEEL, 0, 0, (self._WHEEL_DELTA * dx) & 0xFFFFFFFF, 0)
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int, button: int = 1, steps: int = 24) -> None:
+        """(x1,y1) で押し、補間しながら (x2,y2) まで動かして離す。Windows はボタン押下中の
+        SetCursorPos が WM_MOUSEMOVE（ボタン down）として届くのでドラッグが成立する。"""
+        down = self._DOWN.get(int(button))
+        up = self._UP.get(int(button))
+        if down is None:
+            raise RuntimeError(f"Win32Mouse: unsupported button {button}")
+        n = max(1, int(steps))
+        self._u.SetCursorPos(int(x1), int(y1))
+        self._u.mouse_event(down, 0, 0, 0, 0)
+        for i in range(1, n + 1):
+            t = i / n
+            self._u.SetCursorPos(int(x1 + (x2 - x1) * t), int(y1 + (y2 - y1) * t))
+        self._u.mouse_event(up, 0, 0, 0, 0)
 
 
 def build_handlers():

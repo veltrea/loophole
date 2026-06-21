@@ -60,6 +60,24 @@ class X11Mouse:
         finally:
             lib.x.XCloseDisplay(dpy)
 
+    def drag(self, x1: int, y1: int, x2: int, y2: int, button: int = 1, steps: int = 24) -> None:
+        """(x1,y1) で押し、補間しながら (x2,y2) まで動かして離す。X11 はボタン押下中の
+        XTestFakeMotionEvent がドラッグとして解釈される。"""
+        lib = self._lib
+        dpy = lib.open_display()
+        n = max(1, int(steps))
+        try:
+            lib.xtst.XTestFakeMotionEvent(dpy, -1, int(x1), int(y1), 0)
+            lib.xtst.XTestFakeButtonEvent(dpy, int(button), True, 0)
+            for i in range(1, n + 1):
+                t = i / n
+                lib.xtst.XTestFakeMotionEvent(
+                    dpy, -1, int(x1 + (x2 - x1) * t), int(y1 + (y2 - y1) * t), 0)
+            lib.xtst.XTestFakeButtonEvent(dpy, int(button), False, 0)
+            lib.x.XSync(dpy, False)
+        finally:
+            lib.x.XCloseDisplay(dpy)
+
     @staticmethod
     def _wheel_clicks(dx: int, dy: int):
         clicks = []
@@ -104,6 +122,21 @@ class WaylandMouse:
     def scroll(self, dx: int, dy: int) -> None:
         # ydotool mousemove --wheel で相対ホイール（y は下が正）。
         self._ydotool(["mousemove", "--wheel", "--", str(int(dx)), str(int(dy))])
+
+    def drag(self, x1: int, y1: int, x2: int, y2: int, button: int = 1, steps: int = 24) -> None:
+        """(x1,y1) で押し、補間移動して (x2,y2) で離す。ydotool は press のまま mousemove で
+        ドラッグになる（押下=0x40|low, 解放=0x80|low）。"""
+        low = self._BTN.get(int(button))
+        if low is None:
+            raise RuntimeError(f"mouse: unsupported button {button}")
+        n = max(1, int(steps))
+        self._ydotool(["mousemove", "--absolute", "--", str(int(x1)), str(int(y1))])
+        self._ydotool(["click", f"0x{self._PRESS | low:02X}"])
+        for i in range(1, n + 1):
+            t = i / n
+            self._ydotool(["mousemove", "--absolute", "--",
+                           str(int(x1 + (x2 - x1) * t)), str(int(y1 + (y2 - y1) * t))])
+        self._ydotool(["click", f"0x{self._RELEASE | low:02X}"])
 
 
 def build_mouse(server, runner):

@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "server"))
 sys.path.insert(0, _HERE)
 
 import keys as keyspec  # noqa: E402
+from darwin.keyboard import CGEventKeyboard  # noqa: E402
 from linux_testlib import Checker  # noqa: E402
 
 c = Checker()
@@ -71,6 +72,10 @@ class _FakeCG:
 
     def CGEventSetFlags(self, ev, flags):
         self.log.append(("CGEventSetFlags", ev, flags))
+
+    def CGEventKeyboardSetUnicodeString(self, ev, length, buf):
+        # buf は ctypes の c_void_p（c_uint16 配列をキャストしたもの）。length と合わせて記録する。
+        self.log.append(("CGEventKeyboardSetUnicodeString", ev, int(length)))
 
     def CGEventPost(self, tap, ev):
         self.log.append(("CGEventPost", tap, ev))
@@ -188,5 +193,31 @@ except RuntimeError as exc:
     raised = str(exc)
 c.ok(raised is not None and "no macOS key code" in raised,
      "unmappable main VK raises actionable RuntimeError")
+
+
+# --- CGEventKeyboard.type_text（Unicode 直接注入） -----------------------
+print("CGEventKeyboard.type_text():")
+cg = _FakeCG(source_handle=0xAAAA, key_handles=[0xE001, 0xE002, 0xE003, 0xE004])
+cf = _FakeCF()
+kb = _patched_keyboard(cg, cf)
+kb.type_text("Aあ")  # 2 文字 × (press+release) = 4 イベント。各 1 UTF-16 ユニット。
+
+log_names = [entry[0] for entry in cg.log]
+c.eq(log_names, [
+    "CGEventSourceCreate",
+    "CGEventCreateKeyboardEvent", "CGEventKeyboardSetUnicodeString", "CGEventPost",
+    "CGEventCreateKeyboardEvent", "CGEventKeyboardSetUnicodeString", "CGEventPost",
+    "CGEventCreateKeyboardEvent", "CGEventKeyboardSetUnicodeString", "CGEventPost",
+    "CGEventCreateKeyboardEvent", "CGEventKeyboardSetUnicodeString", "CGEventPost",
+], "each char makes press+release, both carrying the unicode string, both posted")
+c.eq(cg.log[1], ("CGEventCreateKeyboardEvent", 0xAAAA, 0, 1), "press uses keycode 0, key_down=1")
+c.eq(cg.log[2], ("CGEventKeyboardSetUnicodeString", 0xE001, 1), "press carries 1 UTF-16 unit ('A')")
+c.eq(cg.log[4], ("CGEventCreateKeyboardEvent", 0xAAAA, 0, 0), "release uses keycode 0, key_down=0")
+c.eq(cf.released, [0xE001, 0xE002, 0xE003, 0xE004, 0xAAAA],
+     "every event + the source are CFRelease'd (no leak)")
+
+# BMP 外（絵文字 U+1F600）はサロゲートペア = 2 UTF-16 ユニットで 1 イベントに載る。
+c.eq(CGEventKeyboard._utf16_units("😀"), [0xD83D, 0xDE00],
+     "astral char split into a UTF-16 surrogate pair")
 
 c.done()

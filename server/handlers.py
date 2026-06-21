@@ -86,6 +86,14 @@ class KeyboardSender(Protocol):
         """修飾キー（押しっぱなし）+ メインキーを 1 打鍵分送る。"""
         ...
 
+    def type_text(self, text: str) -> None:
+        """文字列を 1 文字ずつ、そのまま打ち込む（ショートカットではなく本文入力）。
+
+        Windows は Unicode 直接注入（KEYEVENTF_UNICODE）でキーボード配列も IME も通さず
+        打てる（日本語も化けない）。Linux は合成キーストロークが**有効な IME を通る**ので
+        ASCII・直接入力向き（日本語は clipboard 貼り付けか ime_set(open=False) を先に）。"""
+        ...
+
 
 class WindowManager(Protocol):
     def list_windows(self, visible_only: bool) -> List[Dict[str, Any]]:
@@ -142,9 +150,19 @@ class MouseController(Protocol):
         """ホイールスクロール。dy>0 で下方向、dx>0 で右方向（クリック数）。"""
         ...
 
+    def drag(self, x1: int, y1: int, x2: int, y2: int, button: int = 1, steps: int = 24) -> None:
+        """(x1,y1) でボタンを押し、(x2,y2) まで動かして離す（ドラッグ）。button=1/2/3。
+        後付けの能力なので backend が実装しない場合がある（handler は hasattr で確認する）。"""
+        ...
+
 
 # ボタン名 → 番号（1=左 / 2=中 / 3=右）。computer use 等と揃えた一般的な対応。
 _MOUSE_BUTTONS = {"left": 1, "middle": 2, "right": 3}
+
+
+def _is_int(v: Any) -> bool:
+    """JSON 由来の値が「真の整数」か（bool は int のサブクラスなので明示的に弾く）。"""
+    return isinstance(v, int) and not isinstance(v, bool)
 
 
 # ---- IME 変換モードのビットフラグ（IMM32 の IME_CMODE_*）---------------------
@@ -299,9 +317,11 @@ class Handlers:
             "read_file": self._read_file,
             "write_file": self._write_file,
             "send_keys": self._send_keys,
+            "type_text": self._type_text,
             "find_files": self._find_files,
             "list_windows": self._list_windows,
             "activate_window": self._activate_window,
+            "set_window": self._set_window,
             "ime_get": self._ime_get,
             "ime_set": self._ime_set,
             "menu_enumerate": self._menu_enumerate,
@@ -309,6 +329,7 @@ class Handlers:
             "mouse_move": self._mouse_move,
             "mouse_click": self._mouse_click,
             "mouse_scroll": self._mouse_scroll,
+            "mouse_drag": self._mouse_drag,
         }
 
     # ping / hello は疎通とセッション情報の確認用
@@ -446,6 +467,24 @@ class Handlers:
             self._keyboard.send_chord(modifiers, main)
         return {"sent": keyspec.normalize(spec), "count": len(chords)}
 
+    def _type_text(self, args: Dict[str, Any]) -> Any:
+        """文字列をそのまま打ち込む（ショートカットではなく本文入力）。
+
+        args:
+          text : 打ち込む文字列（必須）。空文字なら何もしない。
+
+        send_keys が「ショートカット（和音）」専用なのに対し、こちらは 1 文字ずつ
+        そのまま入力する。経路差（Windows=Unicode 直接で IME を通らない／Linux=合成
+        キーは IME を通る）は keyboard backend の type_text が吸収する。
+        """
+        text = args.get("text")
+        if not isinstance(text, str):
+            raise HandlerError("type_text requires string 'text'")
+        if text == "":
+            return {"typed": 0}
+        self._keyboard.type_text(text)
+        return {"typed": len(text)}
+
     def _find_files(self, args: Dict[str, Any]) -> Any:
         """ルート以下をファイル名で検索する（GUI を開かずに目的のファイルを探す）。
 
@@ -578,6 +617,94 @@ class Handlers:
                 f"could not activate window {target.get('title')!r} (focus refused)")
         return {"activated": True, "hwnd": target["hwnd"], "title": target.get("title")}
 
+    def _set_window(self, args: Dict[str, Any]) -> Any:
+        """特定ウィンドウの位置/サイズ/最小化/フルスクリーンを設定する（macOS / Windows / Linux-X11）。
+
+        activate_window が「アプリ全体を前面化」なのに対し、こちらは hwnd（または一意な
+        title）で指す 1 枚のウィンドウの geometry / 状態を、ドラッグも座標探索も無しに変える。
+        macOS は AX 属性、Windows は SetWindowPos/ShowWindow、Linux/X11 は EWMH で実装する
+        （Wayland は汎用のウィンドウ操作プロトコルが無いので未対応）。
+
+        args:
+          title / hwnd  : 対象ウィンドウ（activate_window と同じ解決。hwnd 優先）
+          x, y          : 左上の絶対座標（両方指定で移動）
+          width, height : ウィンドウのサイズ（両方指定・正でリサイズ）
+          minimized     : bool（True=最小化 / False=復元）
+          fullscreen    : bool（True=フルスクリーン / False=解除）
+          maximized     : bool（True=使用可能領域へ最大化）
+          raise         : bool（True=その窓を**窓単位で**前面化。activate がアプリ全体なのに対し1枚だけ）
+        x/y・width/height・minimized・fullscreen・maximized・raise のうち最低 1 つが必須。
+
+        戻り値:
+          成功      : {"updated": True, "hwnd": H, "title": T?, 適用後の
+                       "x","y","width","height","minimized","fullscreen"}
+          曖昧      : {"updated": False, "ambiguous": True, "candidates": [...]}（何も動かさない）
+        """
+        setter = getattr(self._windows, "set_window", None)
+        if not callable(setter):
+            raise HandlerError(
+                "set_window is not supported by this platform's window backend "
+                "(supported on macOS, Windows, and Linux/X11; not on Wayland)")
+
+        position = None
+        if "x" in args or "y" in args:
+            x, y = args.get("x"), args.get("y")
+            if not _is_int(x) or not _is_int(y):
+                raise HandlerError("set_window 'x' and 'y' must both be integers")
+            position = (x, y)
+
+        size = None
+        if "width" in args or "height" in args:
+            w, h = args.get("width"), args.get("height")
+            if not _is_int(w) or not _is_int(h):
+                raise HandlerError("set_window 'width' and 'height' must both be integers")
+            if w <= 0 or h <= 0:
+                raise HandlerError("set_window 'width' and 'height' must be positive")
+            size = (w, h)
+
+        minimized = None
+        if "minimized" in args:
+            if not isinstance(args["minimized"], bool):
+                raise HandlerError("set_window 'minimized' must be a boolean")
+            minimized = args["minimized"]
+
+        fullscreen = None
+        if "fullscreen" in args:
+            if not isinstance(args["fullscreen"], bool):
+                raise HandlerError("set_window 'fullscreen' must be a boolean")
+            fullscreen = args["fullscreen"]
+
+        maximized = None
+        if "maximized" in args:
+            if not isinstance(args["maximized"], bool):
+                raise HandlerError("set_window 'maximized' must be a boolean")
+            maximized = args["maximized"]
+
+        raise_ = None
+        if "raise" in args:
+            if not isinstance(args["raise"], bool):
+                raise HandlerError("set_window 'raise' must be a boolean")
+            raise_ = args["raise"]
+
+        if (position is None and size is None and minimized is None and fullscreen is None
+                and maximized is None and raise_ is None):
+            raise HandlerError(
+                "set_window requires at least one of 'x'/'y', 'width'/'height', "
+                "'minimized', 'fullscreen', 'maximized', 'raise'")
+
+        hwnd, title, ambiguous = self._resolve_target(args)
+        if ambiguous is not None:
+            return {"updated": False, "ambiguous": True, "candidates": ambiguous}
+        state = setter(hwnd, position=position, size=size,
+                       minimized=minimized, fullscreen=fullscreen,
+                       maximized=maximized, raise_=raise_)
+        result: Dict[str, Any] = {"updated": True, "hwnd": hwnd}
+        if title is not None:
+            result["title"] = title
+        if isinstance(state, dict):
+            result.update(state)
+        return result
+
     def _ime_get(self, args: Dict[str, Any]) -> Any:
         """前面ウィンドウの IME 状態を読む（変更はしない）。
 
@@ -664,7 +791,7 @@ class Handlers:
             return hwnd, None, None
         title = args.get("title")
         if not isinstance(title, str) or not title:
-            raise HandlerError("menu command requires 'title' (substring) or 'hwnd' (integer)")
+            raise HandlerError("this command requires 'title' (substring) or 'hwnd' (integer)")
         needle = title.lower()
         candidates = [w for w in self._windows.list_windows(True)
                       if needle in str(w.get("title", "")).lower()]
@@ -785,6 +912,31 @@ class Handlers:
             raise HandlerError("mouse_scroll requires a non-zero 'dx' or 'dy'")
         mouse.scroll(dx, dy)
         return {"scrolled": True, "dx": dx, "dy": dy}
+
+    def _mouse_drag(self, args: Dict[str, Any]) -> Any:
+        """ドラッグ: (x1,y1) で押し、(x2,y2) まで動かして離す。テキスト選択/スライダー/D&D。
+
+        args:
+          x1, y1 : 開始の絶対座標（必須）
+          x2, y2 : 終了の絶対座標（必須）
+          button : "left"(既定) / "middle" / "right"
+          steps  : 中間ドラッグ点の数（既定 24。大きいほど滑らか）
+        単発クリックの押下+解放と違い、押下のまま中間点を **dragged イベント**で送るので
+        本物のドラッグとして成立する（macOS は特にこれが要る）。
+        """
+        mouse = self._require_mouse()
+        drag = getattr(mouse, "drag", None)
+        if not callable(drag):
+            raise HandlerError(
+                "mouse_drag is not supported by this platform's mouse backend yet")
+        x1, y1 = self._coord(args, "x1"), self._coord(args, "y1")
+        x2, y2 = self._coord(args, "x2"), self._coord(args, "y2")
+        num, name = self._button(args)
+        steps = args.get("steps", 24)
+        if not isinstance(steps, int) or isinstance(steps, bool) or steps < 1:
+            raise HandlerError("mouse_drag 'steps' must be a positive integer")
+        drag(x1, y1, x2, y2, num, steps)
+        return {"dragged": True, "button": name, "from": [x1, y1], "to": [x2, y2]}
 
 
 def _join(dirpath: str, name: str) -> str:

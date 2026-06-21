@@ -4,7 +4,7 @@ set -u
 cd "$(dirname "$0")"
 
 fail=0
-for t in tests/test_protocol.py tests/test_protocol_surface.py tests/test_registry.py tests/test_keys.py tests/test_handlers.py tests/test_agent.py tests/test_history.py tests/test_viewer.py tests/test_common_backends.py tests/test_win_backends.py tests/test_linux_parsers.py tests/test_linux_clipboard.py tests/test_linux_screenshot.py tests/test_linux_keyboard.py tests/test_linux_window.py tests/test_linux_ime.py tests/test_linux_menu.py tests/test_linux_mouse.py tests/test_linux_build.py tests/test_darwin_build.py tests/test_darwin_clipboard.py tests/test_darwin_screenshot.py tests/test_darwin_keyboard.py tests/test_darwin_mouse.py tests/test_darwin_window.py tests/test_darwin_ime.py tests/test_e2e_loopback.py; do
+for t in tests/test_protocol.py tests/test_protocol_surface.py tests/test_registry.py tests/test_keys.py tests/test_handlers.py tests/test_agent.py tests/test_history.py tests/test_viewer.py tests/test_common_backends.py tests/test_win_backends.py tests/test_linux_parsers.py tests/test_linux_clipboard.py tests/test_linux_screenshot.py tests/test_linux_keyboard.py tests/test_linux_window.py tests/test_linux_ime.py tests/test_linux_menu.py tests/test_linux_mouse.py tests/test_linux_build.py tests/test_darwin_build.py tests/test_darwin_clipboard.py tests/test_darwin_screenshot.py tests/test_darwin_keyboard.py tests/test_darwin_mouse.py tests/test_darwin_window.py tests/test_darwin_menu.py tests/test_darwin_ime.py tests/test_e2e_loopback.py; do
     echo "=== $t ==="
     if ! python3 "$t"; then
         fail=1

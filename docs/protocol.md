@@ -111,6 +111,8 @@
   - `interactive=true` / `session_id>=1` は「画面のあるデスクトップに居る」を意味する。
   - `protocol_version`/`commands` はクライアントの互換判定に使う（§8）。**古い agent はこれらを返さない**
     （その不在自体が「古い」の信号）。
+  - macOS は加えて `console_user`, `tcc:{accessibility,screen_recording,automation}`（prompt 無し実判定）,
+    `displays:[{id,x,y,width,height,scale,main}, ...]`（各ディスプレイの配置と Retina スケール=物理px/論理pt）を返す。
 
 ### コマンド実行
 
@@ -182,12 +184,26 @@
 
 ### キーボード
 
+> キー入力エミュレーションの**目標と範囲**（何をどこまで狙うか・IME 変換の駆動は非目標）は
+> [architecture.md「キー入力の目標と範囲（スコープ）」](architecture.md) に明文化してある。
+
 #### `send_keys`
 - args: `keys`: 必須 — 文字列（単一 `"ctrl+s"`／空白区切り複数 `"win+r enter"`）か文字列配列 `["win+r","enter"]`。
-  **ショートカット送出専用**（文字入力はクリップボード貼り付けで行う）。
+  **ショートカット送出専用**（文字入力は `type_text` かクリップボード貼り付けで行う）。
 - result: `{"sent": str, "count": int}`（`sent` は正規化後、`count` は和音数）
 - errors: `send_keys requires 'keys' (a string or array of strings)` / キー解析失敗時はその ValueError メッセージ
 - backend: keyboard
+
+#### `type_text`
+- args: `text`: 必須 — そのまま打ち込む文字列。空文字は no-op（`{"typed": 0}`）。
+- result: `{"typed": int}`（打鍵した文字数 = `len(text)`）
+- errors: `type_text requires string 'text'`
+- backend: keyboard
+- 注記: 文字を 1 文字ずつ入力する（`send_keys` の和音とは別経路）。Windows は Unicode 直接注入
+  （KEYEVENTF_UNICODE）でキーボード配列も IME も通さない＝日本語も化けない。macOS も
+  CGEventKeyboardSetUnicodeString で Unicode 直接。Linux（X11=現レイアウトの実キーコードを XTEST／
+  Wayland=`ydotool type`）は ASCII・直接入力向き。X11 ではレイアウトに無い文字（日本語等）を
+  actionable error で弾きクリップボード貼り付けへ誘導する。合成キーは**有効な IME を通る**点に注意。
 
 ### マウス（`mouse` バックエンドは任意。未注入なら全 `mouse_*` がエラー）
 
@@ -211,18 +227,30 @@
 - errors: `mouse control is not available on this agent` / `mouse_scroll 'dx' must be an integer`（/`'dy'`） /
   `mouse_scroll requires a non-zero 'dx' or 'dy'`
 
+#### `mouse_drag`
+- 押す→動かす→離す（ドラッグ）。単発クリックと違い、押下のまま中間点を **dragged イベント**で送るので
+  テキスト範囲選択・スライダー・ドラッグ&ドロップが成立する（macOS は特にこれが要る）。
+- args: `x1`, `y1`, `x2`, `y2`: int, 必須（開始/終了の絶対座標）。`button`: `"left"`(既定)/`"middle"`/`"right"`。
+  `steps`: int, 任意, 既定 `24`（中間点の数。大きいほど滑らか）。
+- result: `{"dragged": true, "button": str, "from": [x1, y1], "to": [x2, y2]}`
+- errors: `mouse control is not available on this agent` /
+  `mouse_drag is not supported by this platform's mouse backend yet`（backend が drag 未実装）/
+  `mouse_move 'x1' must be an integer`（座標非 int）/ `mouse_drag 'steps' must be a positive integer`
+- backend: mouse
+
 ### ウィンドウ
 
 #### `list_windows`
 - args: `pattern`: str, 任意 — タイトル部分一致（大小無視）。`visible_only`: bool, 任意, 既定 `true`。
-- result: `{"windows": [{"hwnd": int, "title": str, "pid": int, "minimized": bool}, ...], "count": int}`
+- result: `{"windows": [{"hwnd": int, "title": str, "pid": int, "minimized": bool, "x": int, "y": int, "width": int, "height": int}, ...], "count": int}`
+  - `x/y/width/height` は geometry を返せる backend（macOS）でのみ付く。`hwnd` は macOS では **CGWindowID**（z-order/タイトルに左右されない安定 ID）。
 - errors: `list_windows 'pattern' must be a string`
 - backend: windows
 
 #### `activate_window`
 - args（`title`/`hwnd` のどちらか必須。`hwnd` 優先）:
   - `hwnd`: int, 任意 — ウィンドウハンドル。
-  - `title`: str, 任意（非空）— 部分一致。複数該当なら**何も前面化せず候補を返す**。
+  - `title`: str, 任意（非空）— 部分一致。複数該当なら**何も前面に出さず候補を返す**。
 - result:
   - hwnd 指定: `{"activated": true, "hwnd": <hwnd>}`
   - title 一意: `{"activated": true, "hwnd": <hwnd>, "title": <title>}`
@@ -232,6 +260,35 @@
   `activate_window requires 'title' (substring) or 'hwnd' (integer)` /
   `no visible window's title contains <title>` / `could not activate window <title> (focus refused)`
 - backend: windows
+
+#### `set_window`
+- 特定ウィンドウ 1 枚の geometry / 状態を設定する。`activate_window`（アプリ全体を前面に出す）と違い
+  ドラッグ・座標探索なしで動かす。**macOS / Windows / Linux-X11 で対応**（Wayland は汎用のウィンドウ
+  操作プロトコルが無いので未対応＝明示エラー）。
+- args（`title`/`hwnd` のどちらか必須。`hwnd` 優先。geometry/状態は最低 1 つ必須）:
+  - `hwnd`: int, 任意 — `list_windows` のハンドル（macOS=CGWindowID で z-order が動いても陳腐化しない /
+    Windows=HWND / Linux=XID）。
+  - `title`: str, 任意（非空）— 部分一致。複数該当なら**何もせず候補を返す**。
+  - `x`, `y`: int — 左上の絶対座標（両方指定で移動）。マルチディスプレイでは負もありうる。
+    座標は物理ピクセル（screenshot/mouse と同系）。
+  - `width`, `height`: int（正）— サイズ（両方指定でリサイズ）。
+  - `minimized`: bool — `true` で最小化 / `false` で復元。
+  - `fullscreen`: bool — `true` でフルスクリーン / `false` で解除（窓が非対応なら無視され結果に反映）。
+    **Windows は OS レベルの全画面が無いので未対応**＝引数は受けるが反映せず readback の `fullscreen`
+    は常に `false`（maximize で代用＝偽陽性にはしない）。macOS / X11 は本物の全画面を `true`/`false` で扱う。
+  - `maximized`: bool — `true` で使用可能領域に最大化（`false` は no-op）。
+  - `raise`: bool — `true` でその窓を**1 枚だけ前面に出す**（`activate_window` のアプリ全体に対し1枚だけ）。
+- result:
+  - 成功: `{"updated": true, "hwnd": <hwnd>, "title": <title>?, "x": int, "y": int, "width": int, "height": int, "minimized": bool, "fullscreen": bool}`（x.. は**適用後の実測値**。`minimized`/`fullscreen` は非同期反映ぶんを backend 側で settle して正直に返す）
+  - 曖昧: `{"updated": false, "ambiguous": true, "candidates": [<window>, ...]}`
+- errors: `set_window is not supported by this platform's window backend (supported on macOS, Windows, and Linux/X11; not on Wayland)` /
+  `set_window 'x' and 'y' must both be integers` / `set_window 'width' and 'height' must both be integers` /
+  `set_window 'width' and 'height' must be positive` / `set_window 'minimized' must be a boolean` /
+  `set_window 'fullscreen' must be a boolean` / `set_window 'maximized' must be a boolean` /
+  `set_window 'raise' must be a boolean` /
+  `set_window requires at least one of 'x'/'y', 'width'/'height', 'minimized', 'fullscreen', 'maximized', 'raise'` /
+  `macOS window access needs Accessibility ...`（未許可時）/ `no window with id <hwnd> ...`（閉じた窓）/ ターゲット解決エラー
+- backend: windows（macOS=AX 属性 / Windows=SetWindowPos·ShowWindow / Linux-X11=EWMH。Wayland は未対応）
 
 ### IME（日本語入力）
 
@@ -268,7 +325,7 @@
     （`command_id` はサブメニューを持つ項目では `null`。`path` はラベルのパンくず。破壊的推測時 `"destructive_guess": true`、
     子があるとき `"submenu": [<item>, ...]`）。
 - errors: ターゲット解決時 — `'hwnd' must be an integer` /
-  `menu command requires 'title' (substring) or 'hwnd' (integer)` / `no visible window's title contains <title>`
+  `this command requires 'title' (substring) or 'hwnd' (integer)` / `no visible window's title contains <title>`
 - backend: menu（＋ windows）
 
 #### `menu_invoke`

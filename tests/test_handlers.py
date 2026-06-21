@@ -148,6 +148,18 @@ expect_error(lambda: h.dispatch("send_keys", {}), "send_keys without keys raises
 expect_error(lambda: h.dispatch("send_keys", {"keys": "ctrl+nope"}), "unknown key name raises")
 expect_error(lambda: h.dispatch("send_keys", {"keys": "ctrl+shift"}), "modifier-only chord raises")
 
+print("type_text (literal typing):")
+kbd.typed.clear()
+out = h.dispatch("type_text", {"text": "Hello, 世界!"})
+check_eq(out["typed"], 10, "typed count == len(text) including non-ASCII")
+check_eq(kbd.typed[-1], "Hello, 世界!", "text passed verbatim to keyboard.type_text")
+kbd.typed.clear()
+out = h.dispatch("type_text", {"text": ""})
+check_eq(out["typed"], 0, "empty text is a no-op")
+check_eq(kbd.typed, [], "empty text does not call the backend")
+expect_error(lambda: h.dispatch("type_text", {}), "type_text without text raises")
+expect_error(lambda: h.dispatch("type_text", {"text": 123}), "non-string text raises")
+
 print("find_files (search by name):")
 h, runner, clip, shot, fs, kbd, win, ime, menu = make_handlers()
 fs.tree = [
@@ -214,6 +226,77 @@ expect_error(lambda: h.dispatch("activate_window", {"title": "Nonexistent"}), "n
 expect_error(lambda: h.dispatch("activate_window", {}), "activate_window without title/hwnd raises")
 win.activate_result = False
 expect_error(lambda: h.dispatch("activate_window", {"hwnd": 11}), "focus refused raises")
+
+print("set_window:")
+h, runner, clip, shot, fs, kbd, win, ime, menu = make_handlers()
+win.windows = [
+    {"hwnd": (100 << 16) | 0, "title": "Editor - Main", "pid": 100, "minimized": False},
+    {"hwnd": (200 << 16) | 0, "title": "Notes", "pid": 200, "minimized": True},
+    {"hwnd": (300 << 16) | 0, "title": "Notes copy", "pid": 300, "minimized": False},
+]
+# backend が set_window を持たない（Win/Linux 相当）→ macOS のみの明示エラー
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 5, "x": 10, "y": 20}),
+             "set_window without backend capability raises (macOS only)")
+
+# 対応 backend を模す fake setter を注入し、渡された軸を記録する
+set_calls = []
+
+
+def _fake_set(hwnd, position=None, size=None, minimized=None, fullscreen=None,
+              maximized=None, raise_=None):
+    set_calls.append({"hwnd": hwnd, "position": position, "size": size,
+                      "minimized": minimized, "fullscreen": fullscreen,
+                      "maximized": maximized, "raise_": raise_})
+    return {"x": position[0] if position else 0, "y": position[1] if position else 0,
+            "width": size[0] if size else 800, "height": size[1] if size else 600,
+            "minimized": bool(minimized), "fullscreen": bool(fullscreen)}
+
+
+win.set_window = _fake_set
+
+out = h.dispatch("set_window", {"hwnd": 42, "x": 10, "y": 20})
+check_eq(out["updated"], True, "set_window by hwnd reports updated")
+check_eq(out["hwnd"], 42, "hwnd echoed back")
+check_eq(set_calls[-1]["position"], (10, 20), "x/y parsed into a position tuple")
+check_eq(out["x"], 10, "backend's applied state is merged into the result")
+
+out = h.dispatch("set_window", {"title": "Editor", "minimized": True})
+check_eq(out["hwnd"], (100 << 16) | 0, "unique title resolves to its hwnd")
+check_eq(out["title"], "Editor - Main", "resolved title echoed back")
+check_eq(set_calls[-1]["minimized"], True, "minimized passed through to backend")
+check_eq(set_calls[-1]["position"], None, "axes not given stay None (untouched)")
+
+h.dispatch("set_window", {"hwnd": 7, "width": 640, "height": 480})
+check_eq(set_calls[-1]["size"], (640, 480), "width/height parsed into a size tuple")
+
+h.dispatch("set_window", {"hwnd": 7, "fullscreen": True})
+check_eq(set_calls[-1]["fullscreen"], True, "fullscreen passed through to backend")
+
+h.dispatch("set_window", {"hwnd": 7, "maximized": True})
+check_eq(set_calls[-1]["maximized"], True, "maximized passed through to backend")
+
+h.dispatch("set_window", {"hwnd": 7, "raise": True})
+check_eq(set_calls[-1]["raise_"], True, "raise passed through as raise_")
+
+out = h.dispatch("set_window", {"title": "Notes", "minimized": True})
+check_eq(out.get("ambiguous"), True, "ambiguous title returns candidates without acting")
+check_eq(out["updated"], False, "ambiguous result is not an update")
+check_eq(len(out["candidates"]), 2, "both Notes windows offered as candidates")
+
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 1}),
+             "set_window with no geometry/state field raises")
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 1, "x": 10}),
+             "x without y raises")
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 1, "width": -5, "height": 5}),
+             "non-positive size raises")
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 1, "minimized": "yes"}),
+             "non-bool minimized raises")
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 1, "fullscreen": 1}),
+             "non-bool fullscreen raises")
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 1, "maximized": "yes"}),
+             "non-bool maximized raises")
+expect_error(lambda: h.dispatch("set_window", {"hwnd": 1, "raise": 1}),
+             "non-bool raise raises")
 
 print("ime_get / ime_set:")
 h, runner, clip, shot, fs, kbd, win, ime, menu = make_handlers()
@@ -374,6 +457,15 @@ check_eq(fm.events, [("button", 1, True), ("button", 1, False)],
 fm.events.clear()
 hm.dispatch("mouse_scroll", {"dy": 3})
 check_eq(fm.events[-1], ("scroll", 0, 3), "mouse_scroll dy -> backend.scroll(0,3)")
+fm.events.clear()
+out = hm.dispatch("mouse_drag", {"x1": 5, "y1": 6, "x2": 50, "y2": 60, "button": "right", "steps": 8})
+check_eq(fm.events[-1], ("drag", 5, 6, 50, 60, 3, 8), "mouse_drag -> backend.drag(...) with button 3")
+check_eq(out, {"dragged": True, "button": "right", "from": [5, 6], "to": [50, 60]}, "drag result")
+out = hm.dispatch("mouse_drag", {"x1": 0, "y1": 0, "x2": 9, "y2": 9})
+check_eq(fm.events[-1], ("drag", 0, 0, 9, 9, 1, 24), "drag defaults: left button, steps=24")
+expect_error(lambda: hm.dispatch("mouse_drag", {"x1": 1, "y1": 2, "x2": 3}), "drag missing y2 -> error")
+expect_error(lambda: hm.dispatch("mouse_drag", {"x1": 1, "y1": 2, "x2": 3, "y2": 4, "steps": 0}),
+             "drag steps<1 -> error")
 expect_error(lambda: hm.dispatch("mouse_move", {"x": 1}), "mouse_move missing y -> error")
 expect_error(lambda: hm.dispatch("mouse_click", {"button": "nope"}), "bad button name -> error")
 expect_error(lambda: hm.dispatch("mouse_scroll", {}), "scroll with no dx/dy -> error")

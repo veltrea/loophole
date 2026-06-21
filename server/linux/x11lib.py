@@ -68,6 +68,19 @@ class _X11Lib:
         x.XFree.argtypes = [void]; x.XFree.restype = cint
         x.XInternAtom.argtypes = [void, ctypes.c_char_p, cint]; x.XInternAtom.restype = ulong
         x.XRaiseWindow.argtypes = [void, ulong]; x.XRaiseWindow.restype = cint
+        x.XDefaultScreen.argtypes = [void]; x.XDefaultScreen.restype = cint
+        # set_window 用: 移動/リサイズ、最小化(iconify)/復元(map)、フレーム相対→root 絶対変換。
+        x.XMoveResizeWindow.argtypes = [void, ulong, cint, cint, ctypes.c_uint, ctypes.c_uint]
+        x.XMoveResizeWindow.restype = cint
+        x.XMoveWindow.argtypes = [void, ulong, cint, cint]; x.XMoveWindow.restype = cint
+        x.XResizeWindow.argtypes = [void, ulong, ctypes.c_uint, ctypes.c_uint]
+        x.XResizeWindow.restype = cint
+        x.XIconifyWindow.argtypes = [void, ulong, cint]; x.XIconifyWindow.restype = cint
+        x.XMapRaised.argtypes = [void, ulong]; x.XMapRaised.restype = cint
+        x.XTranslateCoordinates.argtypes = [
+            void, ulong, ulong, cint, cint,
+            ctypes.POINTER(cint), ctypes.POINTER(cint), ctypes.POINTER(ulong)]
+        x.XTranslateCoordinates.restype = cint
         x.XGetGeometry.argtypes = [
             void, ulong, ctypes.POINTER(ulong), ctypes.POINTER(cint), ctypes.POINTER(cint),
             ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
@@ -84,6 +97,9 @@ class _X11Lib:
         x.XSendEvent.argtypes = [void, ulong, cint, ctypes.c_long, void]
         x.XSendEvent.restype = cint
         x.XKeysymToKeycode.argtypes = [void, ulong]; x.XKeysymToKeycode.restype = ctypes.c_ubyte
+        # type_text の shift 要否判定: 1 キーコードの level0/level1 keysym を引く。
+        x.XGetKeyboardMapping.argtypes = [void, ctypes.c_ubyte, cint, ctypes.POINTER(cint)]
+        x.XGetKeyboardMapping.restype = ctypes.POINTER(ulong)   # KeySym*（XFree で解放）
         x.XSetErrorHandler.argtypes = [void]; x.XSetErrorHandler.restype = void
         # --- セレクション（クリップボード）所有・転送・イベントループ ---
         x.XCreateSimpleWindow.argtypes = [void, ulong, cint, cint, ctypes.c_uint,

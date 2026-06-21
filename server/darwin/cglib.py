@@ -106,6 +106,11 @@ class _CGLib:
         self.cg.CGEventGetFlags.restype = c_uint64
         self.cg.CGEventGetFlags.argtypes = [c_void_p]
 
+        # void CGEventKeyboardSetUnicodeString(CGEventRef, UniCharCount, const UniChar *)
+        # UniChar=uint16(UTF-16) / UniCharCount=UInt32。文字を配列も IME も通さず本文入力する。
+        self.cg.CGEventKeyboardSetUnicodeString.restype = None
+        self.cg.CGEventKeyboardSetUnicodeString.argtypes = [c_void_p, c_uint32, c_void_p]
+
         # ---- マウスイベント ---------------------------------------------------
         # CGEventRef CGEventCreateMouseEvent(src, type, mouseCursorPosition, mouseButton)
         self.cg.CGEventCreateMouseEvent.restype = c_void_p

@@ -17,6 +17,7 @@ handlers.KeyboardSender プロトコルを満たす CGEventKeyboard を提供す
 
 from __future__ import annotations
 
+import ctypes
 from typing import List
 
 import keys as keyspec
@@ -120,6 +121,44 @@ class CGEventKeyboard:
                 cf.CFRelease(release)
         finally:
             cf.CFRelease(source)
+
+    def type_text(self, text: str) -> None:
+        """文字列を 1 文字ずつ、その Unicode を press/release イベントに載せて打ち込む。
+
+        CGEventKeyboardSetUnicodeString はキーコード（配列）も IME も通さず、その文字を
+        前面アプリへ直接届ける。ゆえに日本語でも化けない（Windows の KEYEVENTF_UNICODE 相当）。
+        BMP 外は UTF-16 サロゲートペアに分割して 1 イベントに載せる。TCC（Accessibility）が要る。
+        """
+        lib = self._lib
+        cg, cf = lib.cg, lib.cf
+
+        source = cg.CGEventSourceCreate(HID_SYSTEM_STATE)
+        if not source:
+            raise RuntimeError(
+                "keyboard: CGEventSourceCreate failed "
+                "(likely Accessibility permission denied)")
+        try:
+            for ch in text:
+                units = self._utf16_units(ch)
+                buf = (ctypes.c_uint16 * len(units))(*units)
+                for down in (1, 0):
+                    ev = cg.CGEventCreateKeyboardEvent(source, 0, down)
+                    if not ev:
+                        raise RuntimeError("keyboard: CGEventCreateKeyboardEvent failed")
+                    try:
+                        cg.CGEventKeyboardSetUnicodeString(
+                            ev, len(units), ctypes.cast(buf, ctypes.c_void_p))
+                        cg.CGEventPost(TAP_HID, ev)
+                    finally:
+                        cf.CFRelease(ev)
+        finally:
+            cf.CFRelease(source)
+
+    @staticmethod
+    def _utf16_units(text: str) -> List[int]:
+        """文字列を UTF-16 コードユニット（16bit 整数）の並びにする。BMP 外はサロゲート対。"""
+        raw = text.encode("utf-16-le")
+        return [raw[i] | (raw[i + 1] << 8) for i in range(0, len(raw), 2)]
 
 
 def build_keyboard(runner=None):

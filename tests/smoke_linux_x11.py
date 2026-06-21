@@ -74,6 +74,37 @@ if lw["count"] >= 1:
     print("  ->", aw)
     check(aw.get("activated") is True, "activate_window raises it to the front")
 
+    print("set_window (EWMH: move/resize, maximize, fullscreen, minimize/restore):")
+    hwnd = win["hwnd"]
+    # 移動+リサイズ。xterm はセル単位に量子化するので厳密一致は見ず、戻り値の形と updated を固める
+    # （位置/サイズは情報として print。EWMH を尊重しない WM では best-effort）。
+    mv = h.dispatch("set_window", {"hwnd": hwnd, "x": 60, "y": 70, "width": 500, "height": 360})
+    print("  -> move/resize ->", mv)
+    check(mv.get("updated") is True, "set_window move/resize reports updated")
+    check(all(k in mv for k in ("x", "y", "width", "height", "minimized", "fullscreen")),
+          "readback carries x/y/width/height/minimized/fullscreen")
+
+    # フルスクリーン: X11 は EWMH で本物の全画面 → readback で True/False が観測できる。
+    fs = h.dispatch("set_window", {"hwnd": hwnd, "fullscreen": True})
+    print("  -> fullscreen on ->", fs)
+    check(fs.get("fullscreen") is True, "_NET_WM_STATE_FULLSCREEN add reflects in readback")
+    fs2 = h.dispatch("set_window", {"hwnd": hwnd, "fullscreen": False})
+    print("  -> fullscreen off ->", fs2)
+    check(fs2.get("fullscreen") is False, "_NET_WM_STATE_FULLSCREEN remove reflects in readback")
+
+    # 最大化（True のときだけ作用）。WM 依存だが少なくとも例外を出さず updated を返す。
+    mx = h.dispatch("set_window", {"hwnd": hwnd, "maximized": True})
+    print("  -> maximize ->", mx)
+    check(mx.get("updated") is True, "maximize does not raise and reports updated")
+
+    # 最小化 → 復元。_NET_WM_STATE_HIDDEN が minimized に反映される。
+    mn = h.dispatch("set_window", {"hwnd": hwnd, "minimized": True})
+    print("  -> minimize ->", mn)
+    check(mn.get("minimized") is True, "iconify reflects as minimized=True (settled)")
+    rs = h.dispatch("set_window", {"hwnd": hwnd, "minimized": False})
+    print("  -> restore ->", rs)
+    check(rs.get("minimized") is False, "restore reflects as minimized=False (settled)")
+
 print()
 print("RESULT:", "ALL PASS" if fail == 0 else f"{fail} FAILURE(S)")
 sys.exit(0 if fail == 0 else 1)

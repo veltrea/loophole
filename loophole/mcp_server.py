@@ -680,21 +680,39 @@ def loophole_write_file(path: str, text: str) -> str:
 
 
 @mcp.tool()
-def loophole_send_keys(keys: str | list[str]) -> str:
-    """Send keyboard SHORTCUTS (key chords) to the agent host's foreground window.
+def loophole_send_keys(keys: str | list[str] | None = None, text: str | None = None) -> str:
+    """Send keyboard input to the agent host's foreground window. Two modes - give exactly one.
 
-    This is for shortcuts like Ctrl+S, Alt+F4, Win+R, Enter, Tab - NOT for typing
-    text. To enter text (especially Japanese), use loophole_clipboard_set then paste
-    it with Ctrl+V via this tool, because typed characters go through the IME and garble.
+    keys = keyboard SHORTCUTS (key chords): "ctrl+s", "alt+f4", "win+r", "enter", "tab".
+        Each stroke is "mod+...+key": modifiers are ctrl/alt/shift/win and the last token
+        is the main key (a-z, 0-9, f1-f24, enter, tab, esc, space, up/down/left/right,
+        home/end, pageup/pagedown, delete, insert, ...). Case-insensitive. Pass one stroke
+        ("ctrl+s"), several space-separated ("win+r enter"), or a list (["win+r","enter"]).
 
-    Each stroke is "mod+...+key": modifiers are ctrl/alt/shift/win and the last token
-    is the main key (a-z, 0-9, f1-f24, enter, tab, esc, space, up/down/left/right,
-    home/end, pageup/pagedown, delete, insert, ...). Case-insensitive.
+    text = literal TEXT typed character by character: "hello", "user@example.com".
+        PREFER loophole_clipboard_set + paste (ctrl+v) for entering text — that is the
+        default, IME-safe path on every OS. Reach for `text` only as an ESCAPE HATCH for
+        the cases where paste does not work: fields that reject paste (confirm-password /
+        license-key boxes), web forms that only react to real key events (keydown/input
+        listeners ignore a paste), terminals or games expecting live keystrokes.
+        Mechanics: on Windows characters are injected as Unicode (KEYEVENTF_UNICODE),
+        bypassing the keyboard layout AND the IME, so even Japanese types correctly; macOS
+        also injects Unicode directly; Linux synthesizes real keystrokes (X11: XTEST on the
+        current layout; Wayland: ydotool), so on Linux `text` is ASCII / direct-input only —
+        characters not on the layout (e.g. Japanese) are rejected with a hint, and an active
+        IME can still intercept what is typed (use clipboard paste, or
+        loophole_ime_set(open=False) first). (Needs an agent new enough to advertise the
+        `type_text` command; older agents return a redeploy hint.)
 
     Args:
-        keys: one stroke ("ctrl+s"), several space-separated ("win+r enter"), or a
-              list of strokes (["win+r", "enter"]). Sent left to right.
+        keys: shortcut chord(s) to send. Omit when using text.
+        text: literal string to type. Omit when using keys.
     """
+    if (keys is None) == (text is None):
+        raise _AgentError("loophole_send_keys: give exactly one of 'keys' or 'text'")
+    if text is not None:
+        r = _call("type_text", {"text": text}, via="loophole_send_keys")
+        return f"typed {r.get('typed', 0)} character(s)"
     r = _call("send_keys", {"keys": keys}, via="loophole_send_keys")
     sent = r.get("sent", [])
     return f"sent {r.get('count', 0)} stroke(s): {' '.join(sent)}"
@@ -702,20 +720,23 @@ def loophole_send_keys(keys: str | list[str]) -> str:
 
 @mcp.tool()
 def loophole_mouse(action: str, x: int | None = None, y: int | None = None,
-                   button: str = "left", count: int = 1, dx: int = 0, dy: int = 0) -> str:
-    """Move, click, or scroll the mouse on the agent host's desktop (absolute coords).
+                   button: str = "left", count: int = 1, dx: int = 0, dy: int = 0,
+                   x2: int | None = None, y2: int | None = None, steps: int = 24) -> str:
+    """Move, click, scroll, or drag the mouse on the agent host's desktop (absolute coords).
 
     Coordinates are absolute screen pixels in the same coordinate system as
-    loophole_screenshot. Use this for the simple pointer actions loophole can do
-    without computer use; for complex drag/visual targeting, prefer computer use.
+    loophole_screenshot. Use this for the pointer actions loophole can do without
+    computer use; for visual targeting you still need a screenshot to find coordinates.
 
     Args:
         action: "move" (to x,y), "click" (button at x,y if given; count=2 for double),
-                or "scroll" (by dx/dy wheel clicks)
-        x, y: target coordinates (required for "move"; optional for "click")
-        button: "left" (default), "middle", or "right" (for "click")
+                "scroll" (by dx/dy wheel clicks), or "drag" (press at x,y, move to x2,y2, release)
+        x, y: target coords (required for "move"; optional for "click"; the START for "drag")
+        button: "left" (default), "middle", or "right" (for "click"/"drag")
         count: number of clicks (1 default; 2 = double-click)
         dx, dy: wheel clicks for "scroll" — dy>0 scrolls down, dx>0 scrolls right
+        x2, y2: the END coordinates for "drag"
+        steps: intermediate drag points for "drag" (24 default; higher = smoother/slower)
     """
     if action == "move":
         if x is None or y is None:
@@ -732,7 +753,15 @@ def loophole_mouse(action: str, x: int | None = None, y: int | None = None,
     if action == "scroll":
         r = _call("mouse_scroll", {"dx": dx, "dy": dy}, via="loophole_mouse")
         return f"scrolled dx={r.get('dx')} dy={r.get('dy')}"
-    raise _AgentError("loophole_mouse 'action' must be 'move', 'click', or 'scroll'")
+    if action == "drag":
+        if x is None or y is None or x2 is None or y2 is None:
+            raise _AgentError(
+                "loophole_mouse(action='drag') requires x, y (start) and x2, y2 (end)")
+        r = _call("mouse_drag",
+                  {"x1": x, "y1": y, "x2": x2, "y2": y2, "button": button, "steps": steps},
+                  via="loophole_mouse")
+        return f"{r.get('button')} drag from {r.get('from')} to {r.get('to')}"
+    raise _AgentError("loophole_mouse 'action' must be 'move', 'click', 'scroll', or 'drag'")
 
 
 @mcp.tool()
@@ -940,6 +969,108 @@ def loophole_menu(action: str, title: str | None = None,
     return f"posted command_id={r.get('command_id')} to hwnd={r.get('hwnd')}"
 
 
+def _window_target(title: str | None, hwnd: int | None) -> dict:
+    """title / hwnd から agent に渡すターゲット引数を作る。どちらも無ければエラー。"""
+    if hwnd is not None:
+        return {"hwnd": hwnd}
+    if title:
+        return {"title": title}
+    raise _AgentError("loophole_window needs 'title' or 'hwnd'")
+
+
+def _format_window_list(r: dict) -> str:
+    """list_windows の応答を 1 行 1 ウィンドウの読みやすい一覧にする。"""
+    wins = r.get("windows", [])
+    if not wins:
+        return "no matching windows"
+    lines = [f"hwnd={w.get('hwnd')}  pid={w.get('pid')}  {w.get('title')!r}"
+             + ("  [minimized]" if w.get("minimized") else "")
+             for w in wins]
+    return f"{r.get('count', len(wins))} window(s):\n" + "\n".join(lines)
+
+
+def _format_window_set(r: dict) -> str:
+    """set_window の応答（適用後の実測値）を 1 行に要約する。"""
+    flags = [f for f, on in (("minimized", r.get("minimized")),
+                             ("fullscreen", r.get("fullscreen"))) if on]
+    tail = ("  " + ", ".join(flags)) if flags else ""
+    title = f" {r.get('title')!r}" if r.get("title") else ""
+    return (f"window hwnd={r.get('hwnd')}{title} -> "
+            f"pos ({r.get('x')}, {r.get('y')}) size {r.get('width')}x{r.get('height')}{tail}")
+
+
+@mcp.tool()
+def loophole_window(action: str, title: str | None = None, hwnd: int | None = None,
+                    pattern: str | None = None,
+                    x: int | None = None, y: int | None = None,
+                    width: int | None = None, height: int | None = None,
+                    minimized: bool | None = None, fullscreen: bool | None = None,
+                    maximized: bool | None = None, raise_front: bool | None = None) -> str:
+    """List, activate, or move/resize/minimize/fullscreen/maximize the agent host's windows (blind - no screenshot).
+
+    Drives windows WITHOUT a screenshot or dragging: list gives each window's stable hwnd
+    (plus its geometry), activate brings one to the front, and set changes one window directly.
+
+    action="list": list top-level windows (hwnd, title, pid, minimized, and x/y/width/height).
+        Optional `pattern` filters titles (case-insensitive substring).
+    action="activate": bring a window to the front (un-minimizing it). Give `hwnd` (from list)
+        or a unique `title` substring; an ambiguous title returns candidates without acting.
+    action="set": change ONE window without dragging or pixel-hunting. Target it with `hwnd`
+        or a unique `title`, then pass any of:
+          x & y         - move the top-left to absolute screen coords (both required)
+          width & height- resize (both required, positive)
+          minimized     - True minimizes, False restores
+          fullscreen    - True enters native fullscreen, False exits
+          maximized     - True fills the screen's usable area (maximize)
+          raise_front   - True raises just THIS window to the front (vs activate = whole app)
+        Returns the window's resulting geometry/state. On macOS the hwnd is a CGWindowID that
+        stays valid across z-order changes (no re-listing needed). macOS only today;
+        Windows/Linux agents answer "not supported yet". (Needs an agent new enough to
+        advertise `set_window` - older agents return a redeploy hint.)
+
+    Args:
+        action: "list", "activate", or "set"
+        title: title substring identifying the window (activate/set)
+        hwnd: exact window handle from list (activate/set; preferred over title)
+        pattern: title filter (list only)
+        x, y: move target in absolute screen pixels (set)
+        width, height: new size in pixels (set)
+        minimized: True minimize / False restore (set)
+        fullscreen: True enter / False exit native fullscreen (set)
+        maximized: True maximize to the usable area (set)
+        raise_front: True raise this window to the front, window-level (set)
+    """
+    if action == "list":
+        wargs: dict = {}
+        if pattern:
+            wargs["pattern"] = pattern
+        return _format_window_list(_call("list_windows", wargs, via="loophole_window"))
+    if action == "activate":
+        r = _call("activate_window", _window_target(title, hwnd), via="loophole_window")
+        amb = _menu_ambiguous(r)
+        if amb:
+            return amb
+        return f"activated hwnd={r.get('hwnd')}" + (f" {r.get('title')!r}" if r.get("title") else "")
+    if action == "set":
+        a = _window_target(title, hwnd)
+        for k, v in (("x", x), ("y", y), ("width", width), ("height", height),
+                     ("minimized", minimized), ("fullscreen", fullscreen),
+                     ("maximized", maximized), ("raise", raise_front)):
+            if v is not None:
+                a[k] = v
+        if not any(k in a for k in ("x", "y", "width", "height", "minimized",
+                                    "fullscreen", "maximized", "raise")):
+            raise _AgentError(
+                "loophole_window(action='set') needs at least one of x/y, width/height, "
+                "minimized, fullscreen, maximized, raise_front")
+        r = _call("set_window", a, via="loophole_window")
+        amb = _menu_ambiguous(r)
+        if amb:
+            return amb
+        return _format_window_set(r)
+    raise _AgentError("loophole_window 'action' must be 'list', 'activate', or 'set'")
+
+
 # --- 対話セットアップ（uv run --script mcp_server.py --setup） ----------------
 # 文脈ゼロの他人のところでも自力で完結するための入口。賢い AI を当てにせず、成果物自身が
 # ユーザー本人に「ふつうの言葉で」必要な事実を聞く。専門概念（鍵・ProxyJump 等）は本人に
@@ -1080,6 +1211,9 @@ TOOL_REQUIREMENTS: dict[str, list[str]] = {
     "loophole_ime_get": ["ime_get"],
     "loophole_ime_set": ["ime_set"],
     "loophole_menu": ["menu_enumerate", "menu_invoke"],
+    # list/activate を最小要件にし、古い agent でも window の閲覧/前面化は使えるようにする
+    # （set は macOS のみ／新しい agent のみ。未対応なら呼んだ時に明示エラーになる）。
+    "loophole_window": ["list_windows", "activate_window"],
 }
 
 

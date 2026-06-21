@@ -1,129 +1,84 @@
-"""window.py — macOS のウィンドウ列挙・前面化 backend（osascript / System Events 経由）。
+"""window.py — macOS のウィンドウ列挙・操作 backend（AX + CGWindowID）。
 
-handlers.WindowManager プロトコルを満たす AppleScriptWindowManager。
+handlers.WindowManager を満たす AXWindowManager。**ウィンドウ識別子は CGWindowID**（WindowServer の
+window number）で、z-order やタイトルに左右されない安定 ID。これにより従来の osascript 実装が抱えて
+いた「z-order が動くと index が陳腐化」(-1719) / フルスクリーン窓の再アドレス不可 (-1728) /
+osascript argv の罠を解消する。実体の ctypes 配線は axlib.py。
 
-macOS には EWMH/Win32 のような「外部から渡せる安定したウィンドウ ID」が無い（AX のオブジェクト
-参照は同プロセス内のみで意味を持つ）。loophole の API は OS 非依存に "hwnd: int" を返す契約な
-ので、ここでは:
+  - list_windows : 全アプリのトップレベル窓を {hwnd=CGWindowID, title, pid, minimized, x,y,width,height}
+                   で返す（最小化窓も含む。geometry も同時に返せるようになった）。
+  - activate     : 指定窓を**窓単位で**前面化（AXRaise）＋アプリを frontmost に。
+  - set_window   : 位置/サイズ/最小化/フルスクリーン/最大化/前面化を AX 属性直叩きで設定し、
+                   適用後の実測 state を読み戻す。
 
-  - **hwnd = (pid << 16) | window_index** という合成 ID を作る（list の戻り値）
-  - **activate(hwnd) は上位 16bit を pid として「そのアプリ全体を前面化」する**（best-effort）
-
-実際に「特定の窓だけ raise」は AX の `AXRaise` が要るが、それは後続フェーズ（M12）。まずは
-Win/Linux と同じ操作感の最小実装で push forward する。
-
-データ取得は AppleScript（osascript -e）で行い、System Events に対して 1 行 1 ウィンドウの
-タブ区切り行を吐かせる:
-    pid<TAB>title<TAB>minimized<TAB>visible
-
-これなら JSON 文字列のエスケープに悩まずに済む（タブをタイトルに含むウィンドウは現実的に
-無く、含んだとしても 1 行ぶん壊れるだけで他のウィンドウ列挙は守られる）。
-
-権限: System Events への AppleScript 送信には **Automation 権限**（System Settings >
-Privacy & Security > Automation）が必要。未許可だと osascript が `errAEEventNotPermitted`
-(-1743) で落ちる。
+権限: AX の読み書きには **Accessibility（補助アクセス）** が必須。未許可なら actionable な
+RuntimeError を投げる（黙って空を返さない）。`hello.tcc.accessibility` がこのゲートを手前で示す。
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from common_backends import SubprocessRunner
-from .parsers import parse_window_listing
+from . import axlib as _axlib
 
 
-# 1 行 1 ウィンドウのタブ区切り出力を吐かせる AppleScript。background only=true のプロセス
-# （Dock アイコンを持たない常駐デーモン等）はユーザに見える窓を持たないので除外する。
-_LIST_SCRIPT = '''
-tell application "System Events"
-  set out to ""
-  repeat with proc in (every process whose background only is false)
-    set pid to (unix id of proc)
-    try
-      set procWindows to (windows of proc)
-    on error
-      set procWindows to {}
-    end try
-    repeat with w in procWindows
-      set wtitle to ""
-      try
-        set wtitle to (title of w)
-      end try
-      set wmin to "0"
-      try
-        if (value of attribute "AXMinimized" of w) then set wmin to "1"
-      end try
-      set out to out & (pid as text) & tab & wtitle & tab & wmin & linefeed
-    end repeat
-  end repeat
-  return out
-end tell
-'''
+_ACCESSIBILITY_HINT = (
+    "macOS window access needs Accessibility (assistive access). Grant it in "
+    "System Settings > Privacy & Security > Accessibility for the agent's python, "
+    "then restart the agent.")
 
 
-_ACTIVATE_SCRIPT = '''
-on run argv
-  set targetPid to (item 1 of argv) as integer
-  tell application "System Events"
-    repeat with proc in (every process)
-      if (unix id of proc) is targetPid then
-        set frontmost of proc to true
-        return "ok"
-      end if
-    end repeat
-  end tell
-  return "not-found"
-end run
-'''
+class AXWindowManager:
+    """AX + CGWindowID でウィンドウを列挙・操作する。
 
+    実 ctypes は axlib モジュールに委譲する。テストでは ax にフェイクモジュールを注入できる
+    （ctypes/実 OS を呼ばずに list/activate/set のロジックを検証する）。
+    """
 
-def _split_hwnd(hwnd: int) -> int:
-    """合成 hwnd（pid<<16 | index）から pid を取り出す。"""
-    return int(hwnd) >> 16
+    def __init__(self, ax=None, runner: Optional[object] = None):
+        # runner は API 互換のため受けるだけ（AX backend は subprocess を使わない）。
+        self._ax = ax if ax is not None else _axlib
 
-
-class AppleScriptWindowManager:
-    """osascript + System Events 経由で window list / activate を行う。"""
-
-    def __init__(self, runner: Optional[object] = None):
-        self._runner = runner or SubprocessRunner()
+    def _require_trusted(self) -> None:
+        if not self._ax.is_process_trusted():
+            raise RuntimeError(_ACCESSIBILITY_HINT)
 
     def list_windows(self, visible_only: bool) -> List[Dict[str, Any]]:
-        r = self._runner.run(
-            ["osascript", "-e", _LIST_SCRIPT], None, 10.0, None)
-        if not r.started:
-            raise RuntimeError(
-                "window list failed: osascript not found "
-                "(this should ship with macOS)")
-        if r.exit_code != 0:
-            err = (r.stderr or b"").decode("utf-8", "replace").strip()
-            # Automation 権限拒否の典型エラー文言を見たら hint を足す
-            hint = ""
-            if "-1743" in err or "not authorized" in err.lower():
-                hint = (" — grant Automation permission to your terminal/agent in "
-                        "System Settings > Privacy & Security > Automation")
-            raise RuntimeError(f"window list failed: osascript exit={r.exit_code} ({err}){hint}")
-        text = (r.stdout or b"").decode("utf-8", "replace")
-        return parse_window_listing(text, visible_only)
+        self._require_trusted()
+        wins = self._ax.list_windows()
+        if visible_only:
+            wins = [w for w in wins if str(w.get("title", "")).strip()]
+        return [{
+            "hwnd": w["hwnd"], "title": w["title"], "pid": w["pid"],
+            "minimized": w["minimized"],
+            "x": w["x"], "y": w["y"], "width": w["width"], "height": w["height"],
+        } for w in wins]
 
     def activate(self, hwnd: int) -> bool:
-        pid = _split_hwnd(hwnd)
-        r = self._runner.run(
-            ["osascript", "-e", _ACTIVATE_SCRIPT, "-", str(pid)],
-            None, 10.0, None)
-        if not r.started:
-            raise RuntimeError("window activate failed: osascript not found")
-        if r.exit_code != 0:
-            err = (r.stderr or b"").decode("utf-8", "replace").strip()
-            hint = ""
-            if "-1743" in err or "not authorized" in err.lower():
-                hint = (" — grant Automation permission in System Settings > "
-                        "Privacy & Security > Automation")
-            raise RuntimeError(f"window activate failed: osascript exit={r.exit_code} ({err}){hint}")
-        out = (r.stdout or b"").decode("utf-8", "replace").strip()
-        return out == "ok"
+        self._require_trusted()
+        return bool(self._ax.raise_window(int(hwnd)))
+
+    def set_window(self, hwnd: int, position=None, size=None,
+                   minimized: Optional[bool] = None, fullscreen: Optional[bool] = None,
+                   maximized: Optional[bool] = None, raise_: Optional[bool] = None) -> Dict[str, Any]:
+        """CGWindowID の窓の geometry/状態を設定し、適用後 state を返す。
+
+        position=(x,y) / size=(w,h) / minimized / fullscreen は省略可（None=触らない）。
+        maximized=True で使用可能領域に最大化、raise_=True で窓単位の前面化。
+        窓が見つからない（閉じた等）ときは actionable な RuntimeError。
+        """
+        self._require_trusted()
+        state = self._ax.set_window(
+            int(hwnd), position=position, size=size,
+            minimized=minimized, fullscreen=fullscreen,
+            maximized=bool(maximized), do_raise=bool(raise_))
+        if state is None:
+            raise RuntimeError(
+                f"no window with id {hwnd} (it may have closed or been re-created; "
+                "re-run list_windows to get a current id)")
+        return state
 
 
 def build_window(runner=None):
     """darwin/__init__.py から呼ばれるファクトリ。"""
-    return AppleScriptWindowManager(runner=runner)
+    return AXWindowManager(runner=runner)

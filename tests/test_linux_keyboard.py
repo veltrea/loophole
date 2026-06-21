@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "server"))
 sys.path.insert(0, _HERE)
 
 import linux_backends as lb  # noqa: E402
+from linux.keyboard import _char_to_keysym  # noqa: E402
 from handlers import ProcessResult  # noqa: E402
 from linux_testlib import Checker, FakeRunner  # noqa: E402
 
@@ -45,5 +46,26 @@ except RuntimeError as exc:
     raised = str(exc)
 c.ok(raised is not None and "ydotoold is not running" in raised,
      "ydotool exit!=0 + pgrep=miss -> daemon hint surfaces in send_keys error")
+
+print("WaylandKeyboard.type_text (ydotool type):")
+kr = FakeRunner({"ydotool": ProcessResult(0, b"", b"")})
+lb.WaylandKeyboard(kr).type_text("hi -x")
+c.eq(kr.calls[-1][0], ["ydotool", "type", "--", "hi -x"],
+     "type_text -> `ydotool type -- <text>` (`--` keeps leading-dash text safe)")
+raised = None
+try:
+    lb.WaylandKeyboard(FakeRunner({})).type_text("hi")
+except RuntimeError as exc:
+    raised = str(exc)
+c.ok(raised is not None and "type_text" in raised and "ydotool" in raised,
+     "missing ydotool -> actionable type_text error")
+
+# X11 の type_text（空きキーコード再マップ）は実機 X11 でのみ動くので smoke 側で確認する。
+# 文字→keysym の純変換だけここで押さえる（Latin-1 は同値、それ以外は 0x01000000|cp）。
+print("_char_to_keysym (Unicode keysym rule):")
+c.eq(_char_to_keysym("A"), 0x41, "ASCII 'A' -> keysym 0x41")
+c.eq(_char_to_keysym("é"), 0xE9, "Latin-1 'é' (U+00E9) -> keysym 0x00E9")
+c.eq(_char_to_keysym("あ"), 0x3042 | 0x01000000,
+     "'あ' (U+3042) -> Unicode keysym 0x0100_3042")
 
 c.done()

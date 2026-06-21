@@ -169,6 +169,99 @@ finally:
     else:
         os.environ["LOOPHOLE_SCREENSHOT_BACKEND"] = _orig_env
 
+print("Win32WindowManager.set_window — axes map to the right Win32 calls (fake user32):")
+# Win32 直叩きは windll を触るので、__new__ で構築して self._u にフェイクを差す（raise 経路は
+# activate→windll.kernel32 を触るため Mac では検証しない＝Windows 実機スモークで確認する）。
+
+
+class FakeUser32:
+    def __init__(self, rect=(0, 0, 0, 0), iconic=False, is_window=True):
+        self.calls = []
+        self._rect = rect
+        self._iconic = iconic
+        self._is_window = is_window
+
+    def IsWindow(self, h):
+        return 1 if self._is_window else 0
+
+    def ShowWindow(self, h, cmd):
+        self.calls.append(("ShowWindow", cmd)); return 1
+
+    def SetWindowPos(self, h, after, x, y, w, ht, flags):
+        self.calls.append(("SetWindowPos", x, y, w, ht, flags)); return 1
+
+    def GetWindowRect(self, h, p):
+        p.contents.left, p.contents.top, p.contents.right, p.contents.bottom = self._rect
+        return 1
+
+    def IsIconic(self, h):
+        return 1 if self._iconic else 0
+
+
+wm = win_backends.Win32WindowManager.__new__(win_backends.Win32WindowManager)
+fake_u = FakeUser32(rect=(100, 150, 740, 630), iconic=False)  # → w=640, h=480
+wm._u = fake_u
+
+# move + resize → 1 回の SetWindowPos（NOZORDER|NOACTIVATE のみ。NOMOVE/NOSIZE は立てない）
+st = wm.set_window(123, position=(100, 150), size=(640, 480))
+swp = [c for c in fake_u.calls if c[0] == "SetWindowPos"][-1]
+check(swp[1:5] == (100, 150, 640, 480), "SetWindowPos receives x,y,w,h")
+check(swp[5] == (win_backends._SWP_NOZORDER | win_backends._SWP_NOACTIVATE),
+      "move+resize sets neither NOMOVE nor NOSIZE")
+check(st == {"x": 100, "y": 150, "width": 640, "height": 480,
+             "minimized": False, "fullscreen": False},
+      "readback derives w/h from GetWindowRect; fullscreen is always False")
+
+# move only → NOSIZE を立てる（サイズを残す）
+fake_u.calls.clear()
+wm.set_window(123, position=(10, 20))
+swp = [c for c in fake_u.calls if c[0] == "SetWindowPos"][-1]
+check(swp[5] & win_backends._SWP_NOSIZE and not swp[5] & win_backends._SWP_NOMOVE,
+      "position-only sets SWP_NOSIZE (and not NOMOVE)")
+
+# resize only → NOMOVE を立てる（位置を残す）
+fake_u.calls.clear()
+wm.set_window(123, size=(800, 600))
+swp = [c for c in fake_u.calls if c[0] == "SetWindowPos"][-1]
+check(swp[5] & win_backends._SWP_NOMOVE and not swp[5] & win_backends._SWP_NOSIZE,
+      "size-only sets SWP_NOMOVE (and not NOSIZE)")
+
+# 最小化/復元 → ShowWindow(SW_MINIMIZE / SW_RESTORE)
+fake_u.calls.clear()
+wm.set_window(123, minimized=True)
+check(("ShowWindow", win_backends._SW_MINIMIZE) in fake_u.calls,
+      "minimized=True → ShowWindow(SW_MINIMIZE)")
+fake_u.calls.clear()
+wm.set_window(123, minimized=False)
+check(("ShowWindow", win_backends._SW_RESTORE) in fake_u.calls,
+      "minimized=False → ShowWindow(SW_RESTORE)")
+
+# 最大化は True のときだけ作用（False は no-op = macOS/protocol と揃える）
+fake_u.calls.clear()
+wm.set_window(123, maximized=True)
+check(("ShowWindow", win_backends._SW_MAXIMIZE) in fake_u.calls,
+      "maximized=True → ShowWindow(SW_MAXIMIZE)")
+fake_u.calls.clear()
+wm.set_window(123, maximized=False)
+check(all(c[0] != "ShowWindow" for c in fake_u.calls),
+      "maximized=False is a no-op (no ShowWindow)")
+
+# fullscreen は捏造しない: maximize に化けさせず、readback も常に False
+fake_u.calls.clear()
+st = wm.set_window(123, fullscreen=True)
+check(all(c[0] != "ShowWindow" for c in fake_u.calls) and st["fullscreen"] is False,
+      "fullscreen=True is not faked via maximize; readback stays False (no OS fullscreen on Windows)")
+
+# 窓が無い → actionable な RuntimeError
+wm._u = FakeUser32(is_window=False)
+raised_sw = None
+try:
+    wm.set_window(999, minimized=True)
+except RuntimeError as exc:
+    raised_sw = str(exc)
+check(raised_sw is not None and "999" in raised_sw,
+      "missing window raises an actionable RuntimeError naming the handle")
+
 print("Win32MenuController — constants & off-Windows guard (Mac-safe contract):")
 check(win_backends._WM_COMMAND == 0x0111, "WM_COMMAND constant is 0x0111")
 check(len(win_backends._MENUITEMINFOW._fields_) == 12, "_MENUITEMINFOW declares all 12 fields")

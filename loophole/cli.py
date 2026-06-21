@@ -20,6 +20,7 @@
     python3 loophole.py find "C:/Users" "*.txt"       # ファイル名検索（部分一致は --substring）
     python3 loophole.py windows                        # 開いているウィンドウ一覧（絞り込み: windows Notepad）
     python3 loophole.py activate Notepad              # タイトル部分一致で前面化（HWND 指定は --hwnd 12345）
+    python3 loophole.py win-set Notepad --x 100 --y 80 # 窓を移動/リサイズ/最小化/フルスクリーン（macOS のみ）
     python3 loophole.py ime-get                         # 前面ウィンドウの IME 状態を読む
     python3 loophole.py ime-set --off                  # IME を切る（直接入力＝type が IME に化けない）
     python3 loophole.py ime-set --on --mode hiragana   # IME を ON にしてひらがな入力へ
@@ -150,6 +151,29 @@ def main(argv=None) -> int:
     p_activate.add_argument("--hwnd", type=int, default=None,
                             help="exact window handle (from `windows`)")
 
+    p_winset = sub.add_parser(
+        "win-set",
+        help="move/resize/minimize/fullscreen one window (macOS only today)")
+    p_winset.add_argument("title", nargs="?", default=None, help="title substring")
+    p_winset.add_argument("--hwnd", type=int, default=None,
+                          help="exact window handle (from `windows`)")
+    p_winset.add_argument("--x", type=int, default=None, help="move: top-left X (needs --y)")
+    p_winset.add_argument("--y", type=int, default=None, help="move: top-left Y (needs --x)")
+    p_winset.add_argument("--width", type=int, default=None,
+                          help="resize: width (needs --height)")
+    p_winset.add_argument("--height", type=int, default=None,
+                          help="resize: height (needs --width)")
+    g_min = p_winset.add_mutually_exclusive_group()
+    g_min.add_argument("--minimize", dest="minimized", action="store_true", default=None)
+    g_min.add_argument("--restore", dest="minimized", action="store_false")
+    g_full = p_winset.add_mutually_exclusive_group()
+    g_full.add_argument("--fullscreen", dest="fullscreen", action="store_true", default=None)
+    g_full.add_argument("--unfullscreen", dest="fullscreen", action="store_false")
+    p_winset.add_argument("--maximize", dest="maximized", action="store_true", default=None,
+                          help="maximize to the usable area")
+    p_winset.add_argument("--raise", dest="raise_front", action="store_true", default=None,
+                          help="raise just this window to the front (window-level)")
+
     sub.add_parser("ime-get", help="read the foreground window's IME state")
 
     p_imeset = sub.add_parser("ime-set", help="change the foreground window's IME state")
@@ -219,6 +243,38 @@ def main(argv=None) -> int:
             else:
                 parser.error("activate needs a title substring or --hwnd")
                 return 2
+        elif args.cmd == "win-set":
+            sargs: Dict[str, Any] = {}
+            if args.hwnd is not None:
+                sargs["hwnd"] = args.hwnd
+            elif args.title:
+                sargs["title"] = args.title
+            else:
+                parser.error("win-set needs a title substring or --hwnd")
+                return 2
+            if args.x is not None:
+                sargs["x"] = args.x
+            if args.y is not None:
+                sargs["y"] = args.y
+            if args.width is not None:
+                sargs["width"] = args.width
+            if args.height is not None:
+                sargs["height"] = args.height
+            if args.minimized is not None:
+                sargs["minimized"] = args.minimized
+            if args.fullscreen is not None:
+                sargs["fullscreen"] = args.fullscreen
+            if args.maximized is not None:
+                sargs["maximized"] = args.maximized
+            if args.raise_front is not None:
+                sargs["raise"] = args.raise_front
+            if not any(k in sargs for k in ("x", "y", "width", "height", "minimized",
+                                            "fullscreen", "maximized", "raise")):
+                parser.error("win-set needs at least one of --x/--y, --width/--height, "
+                             "--minimize/--restore, --fullscreen/--unfullscreen, "
+                             "--maximize, --raise")
+                return 2
+            resp = client.call("set_window", sargs)
         elif args.cmd == "ime-get":
             resp = client.call("ime_get")
         elif args.cmd == "ime-set":

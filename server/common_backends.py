@@ -173,32 +173,146 @@ def _darwin_console_user() -> Optional[str]:
 
 
 def _darwin_tcc_probe() -> Dict[str, Optional[bool]]:
-    """Mac の TCC（プライバシー許可）の現状を素朴に判定する。
+    """Mac の TCC（プライバシー許可）の現状を **prompt 無しで** 判定する。
 
-    - accessibility: AXIsProcessTrusted() を ApplicationServices 経由で見る（prompt なし）。
-    - screen_recording / automation: agent 起動時には判定しない（実呼び出し時の失敗で
-      自然に表面化するため）。ここでは None を返し、`hello` の段階では false 確定を避ける。
+    `hello` の段階で実判定し、呼ぶ前に不足を警告できるようにする。現行の backend が要る権限:
+      - **window / menu / keys / mouse → Accessibility**（AX 直叩き / CGEventPost）。
+      - **screenshot → Screen Recording**。
+      - automation（AppleEvents → System Events）は **osascript 時代の依存で、今の AX backend は不要**。
+        互換のため field は残すが best-effort（System Events 非起動時は判定不能 = None）。
 
-    ApplicationServices が import できない/ld できない環境（極稀な配布）でも壊さない。
+    - accessibility   : `AXIsProcessTrusted()`（ApplicationServices）。
+    - screen_recording: `CGPreflightScreenCaptureAccess()`（CoreGraphics, 10.15+, prompt 無し）。
+    - automation      : `AEDeterminePermissionToAutomateTarget(..., askUserIfNeeded=false)`。
+
+    どれも True=許可 / False=拒否 / None=判定不能（古い OS・ld 不可・未決定）。各プローブは個別に
+    try で囲み、1 つ失敗しても他を潰さない。
     """
     out: Dict[str, Optional[bool]] = {
         "accessibility": None,
         "screen_recording": None,
         "automation": None,
     }
+    import ctypes
+    from ctypes import util as _ctutil
+
+    try:
+        path = _ctutil.find_library("ApplicationServices")
+        if path:
+            lib = ctypes.CDLL(path)
+            lib.AXIsProcessTrusted.restype = ctypes.c_int
+            lib.AXIsProcessTrusted.argtypes = []
+            out["accessibility"] = bool(lib.AXIsProcessTrusted())
+    except Exception:  # pragma: no cover - ld 不可など環境依存
+        pass
+
+    try:
+        cgpath = _ctutil.find_library("CoreGraphics") or _ctutil.find_library("ApplicationServices")
+        if cgpath:
+            cg = ctypes.CDLL(cgpath)
+            fn = getattr(cg, "CGPreflightScreenCaptureAccess", None)
+            if fn is not None:
+                fn.restype = ctypes.c_bool
+                fn.argtypes = []
+                out["screen_recording"] = bool(fn())
+    except Exception:  # pragma: no cover
+        pass
+
+    try:
+        out["automation"] = _darwin_automation_probe()
+    except Exception:  # pragma: no cover
+        pass
+
+    return out
+
+
+def _darwin_automation_probe() -> Optional[bool]:
+    """自プロセスが System Events を自動化（AppleEvents）できるかを prompt 無しで判定する。
+
+    `AEDeterminePermissionToAutomateTarget(target=System Events, *, askUserIfNeeded=false)` の
+    OSStatus を見る: 0=許可 / -1743(errAEEventNotPermitted)=拒否 / それ以外（-1744 未決定 /
+    -600 procNotFound = System Events 非起動で判定不能）= None。best-effort（System Events を
+    起こさないので、起動していなければ None になる）。今の AX backend はこの権限を必要としない。
+    """
+    import ctypes
+    from ctypes import util as _ctutil
+
+    path = _ctutil.find_library("CoreServices")
+    if not path:
+        return None
+    cs = ctypes.CDLL(path)
+    fn = getattr(cs, "AEDeterminePermissionToAutomateTarget", None)
+    if fn is None:
+        return None  # 古い OS（10.14 未満）にはこの API が無い
+
+    class _AEDesc(ctypes.Structure):
+        _fields_ = [("descriptorType", ctypes.c_uint32), ("dataHandle", ctypes.c_void_p)]
+
+    cs.AECreateDesc.restype = ctypes.c_int
+    cs.AECreateDesc.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_long, ctypes.POINTER(_AEDesc)]
+    cs.AEDisposeDesc.restype = ctypes.c_int
+    cs.AEDisposeDesc.argtypes = [ctypes.POINTER(_AEDesc)]
+    fn.restype = ctypes.c_int32
+    fn.argtypes = [ctypes.POINTER(_AEDesc), ctypes.c_uint32, ctypes.c_uint32, ctypes.c_bool]
+
+    _TYPE_BUNDLE_ID = 0x62756E64  # 'bund'（typeApplicationBundleID）
+    _TYPE_WILDCARD = 0x2A2A2A2A   # '****'（typeWildCard）
+    bundle = b"com.apple.systemevents"
+
+    desc = _AEDesc()
+    if cs.AECreateDesc(_TYPE_BUNDLE_ID, bundle, len(bundle), ctypes.byref(desc)) != 0:
+        return None
+    try:
+        status = fn(ctypes.byref(desc), _TYPE_WILDCARD, _TYPE_WILDCARD, False)
+    finally:
+        cs.AEDisposeDesc(ctypes.byref(desc))
+
+    if status == 0:
+        return True            # 許可済み
+    if status == -1743:        # errAEEventNotPermitted
+        return False           # 明示拒否
+    return None                # -1744（未決定）など
+
+
+def _darwin_list_displays() -> Optional[list]:
+    """アクティブな各ディスプレイの配置とスケールを返す（screenshot 座標の解釈用）。
+
+    各要素: {"id", "x","y","width","height"（論理 points）, "scale"（物理px/論理pt = Retina で 2.0）,
+    "main": bool}。CoreGraphics の CGGetActiveDisplayList / CGDisplayBounds / CGDisplayPixelsWide。
+    取れなければ None（古い OS・ld 不可）。
+    """
     try:
         import ctypes
         from ctypes import util as _ctutil
-        path = _ctutil.find_library("ApplicationServices")
-        if not path:
-            return out
-        lib = ctypes.CDLL(path)
-        lib.AXIsProcessTrusted.restype = ctypes.c_int
-        lib.AXIsProcessTrusted.argtypes = []
-        out["accessibility"] = bool(lib.AXIsProcessTrusted())
-    except Exception:  # pragma: no cover - ld 不可など環境依存
-        pass
-    return out
+        cg = ctypes.CDLL(_ctutil.find_library("CoreGraphics"))
+        cnt = ctypes.c_uint32(0)
+        arr = (ctypes.c_uint32 * 16)()
+        if cg.CGGetActiveDisplayList(16, arr, ctypes.byref(cnt)) != 0:
+            return None
+
+        class _R(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
+                        ("w", ctypes.c_double), ("h", ctypes.c_double)]
+
+        cg.CGDisplayBounds.restype = _R
+        cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+        cg.CGDisplayPixelsWide.restype = ctypes.c_long
+        cg.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        cg.CGMainDisplayID.argtypes = []
+        main = cg.CGMainDisplayID()
+        out = []
+        for i in range(cnt.value):
+            d = arr[i]
+            b = cg.CGDisplayBounds(d)
+            pw = cg.CGDisplayPixelsWide(d)
+            scale = round(pw / b.w, 2) if b.w else 1.0
+            out.append({"id": int(d), "x": int(b.x), "y": int(b.y),
+                        "width": int(b.w), "height": int(b.h),
+                        "scale": scale, "main": bool(d == main)})
+        return out
+    except Exception:  # pragma: no cover - 環境依存
+        return None
 
 
 def _darwin_session_info() -> Dict[str, Any]:
@@ -212,7 +326,10 @@ def _darwin_session_info() -> Dict[str, Any]:
     返値:
       - console_user: /dev/console のオーナ（対面ログイン中のユーザ名）or None
       - interactive : console_user と自プロセスのユーザが一致していれば True
-      - tcc         : {"accessibility": bool|None, "screen_recording": None, "automation": None}
+      - tcc         : {"accessibility": bool|None, "screen_recording": bool|None, "automation": bool|None}
+                      （3 つとも prompt 無しで実判定。True=許可 / False=拒否 / None=判定不能）
+      - displays    : [{"id","x","y","width","height","scale","main"}, ...]（各ディスプレイの配置と
+                      Retina スケール。screenshot 座標の解釈に使う）or None
     """
     console_user = _darwin_console_user()
     self_user = os.environ.get("USER") or os.environ.get("LOGNAME")
@@ -225,6 +342,7 @@ def _darwin_session_info() -> Dict[str, Any]:
         "console_user": console_user,
         "interactive": interactive,
         "tcc": _darwin_tcc_probe(),
+        "displays": _darwin_list_displays(),
     }
 
 

@@ -83,9 +83,14 @@ class FakeKeyboard:
     def __init__(self):
         # 送られた打鍵を (modifiers, main) のタプルで記録する。
         self.sent = []
+        # type_text で打ち込まれた文字列を順に記録する。
+        self.typed = []
 
     def send_chord(self, modifiers, main):
         self.sent.append((list(modifiers), main))
+
+    def type_text(self, text):
+        self.typed.append(text)
 
 
 class FakeEnv:
@@ -146,6 +151,9 @@ class FakeMouse:
 
     def scroll(self, dx, dy):
         self.events.append(("scroll", dx, dy))
+
+    def drag(self, x1, y1, x2, y2, button=1, steps=24):
+        self.events.append(("drag", x1, y1, x2, y2, button, steps))
 
 
 class FakeMenuController:
